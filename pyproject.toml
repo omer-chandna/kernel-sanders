@@ -1,0 +1,20 @@
+[project]
+name = "adakernel"
+version = "0.1.0"
+description = "Low-VRAM LLM inference experiments for Ada consumer GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pyyaml",
+]
+
+[project.optional-dependencies]
+bench = ["pytest", "pandas", "matplotlib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["adakernel*", "benchmarks*"]
