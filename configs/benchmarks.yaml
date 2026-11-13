@@ -1,0 +1,22 @@
+kernel:
+  rows: 1024
+  k: 1024
+  seq: 512
+  heads: 8
+  iters: 20
+  warmup: 5
+inference:
+  shapes: [tiny, small, medium]
+  generated_tokens: 32
+  prompt_tokens: 16
+  repetitions: 5
+  warmup: 1
+memory:
+  n_gpu_layers: [4, 2, 1, 0]
+tolerances:
+  fp32_kernel_atol: 1.0e-4
+  fp32_kernel_rtol: 1.0e-4
+  q8_matvec_atol: 1.0e-4
+  q4k_matvec_atol: 1.0e-4
+  model_logit_atol: 2.0e-3
+  model_logit_rtol: 2.0e-3
