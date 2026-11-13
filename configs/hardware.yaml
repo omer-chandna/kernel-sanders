@@ -1,0 +1,39 @@
+platform: Windows-11-10.0.26200-SP0
+processor: AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD
+python: 3.12.2 (tags/v3.12.2:6abddd9, Feb  6 2024, 21:26:36) [MSC v.1937 64 bit (AMD64)]
+nvidia_smi:
+  name: NVIDIA GeForce RTX 4060
+  driver_version: '621.14'
+  memory_total_mb: '8188'
+  memory_used_mb: '898'
+  utilization_gpu: '0'
+  temperature_c: '49.53'
+  sm_clock_mhz: '2505'
+  mem_clock_mhz: '8501'
+  power_w: '[N/A]'
+  pcie_gen: '3'
+  pcie_width: '8'
+cuda_device:
+  name: NVIDIA GeForce RTX 4060
+  pci_bus_id: '0000:01:00.0'
+  compute_capability: '8.9'
+  sm_count: 24
+  warp_size: 32
+  max_threads_per_block: 1024
+  max_threads_per_sm: 1536
+  regs_per_sm: 65536
+  shared_mem_per_sm: 102400
+  shared_mem_per_block: 49152
+  shared_mem_per_block_optin: 101376
+  l2_cache_bytes: 25165824
+  memory_clock_khz: 8501000
+  memory_bus_width_bits: 128
+  cooperative_launch: 1
+  persistent_max_blocks: 96
+  pci_bus: 1
+  pci_device: 0
+  clock_sm_khz: 2505000
+  total_vram_mb: 8187.5
+  free_vram_mb: 7106.0
+  theoretical_bandwidth_gbps: 272.0320129394531
+dll: C:\Users\OmerC\kernel-sanders\build\adakernel.dll

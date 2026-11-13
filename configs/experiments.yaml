@@ -1,0 +1,17 @@
+smoke: false
+shapes: tiny,small
+kernel_iters: 20
+inference_reps: 5
+n_gen: 32
+warmup: 1
+backends:
+  - eager
+  - cuda-graph
+  - fused
+  - persistent
+  - hybrid
+  - cublas
+notes:
+  batch_size: 1
+  sampling: greedy argmax
+  precision: fp32 activations and weights unless a kernel benchmark says otherwise
