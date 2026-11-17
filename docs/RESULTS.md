@@ -111,6 +111,52 @@ Medium model, persistent backend, three repetitions, 16 generated tokens. Chunk 
 
 Chunk size changes throughput by more than 3x. Worker counts from 24 through 96 sit on top of each other. Eight workers are slower. The default remains 64-row chunks and the occupancy cap.
 
+## Table E. Real Qwen3 GGUF decode (AdaKernel vs llama.cpp)
+
+`python -m benchmarks.gguf_bench --model <file>`, run back to back with llama-bench in the same session so both
+see the same clocks. Prompt "The capital of France is" (5 tokens, fed one at a time), 128 greedy decode tokens,
+5 repetitions, median. llama.cpp is `llama-bench -p 0 -n 128 -ngl 99 -fa 1`. JSON in
+`experiments/results/gguf_<model>.json`.
+
+| Model | llama.cpp tg128 | AdaKernel cuda-graph | eager | persistent | hybrid |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-0.6B Q8_0 | 253.4 (sd 2.4) | **269.0** (252.0-271.4) | 223.6 | 173.5 | 173.1 |
+| Qwen3-8B Q4_K_M | **48.9** (sd 0.08) | 47.4 (47.3-47.4) | 45.8 | 41.1 | 41.4 |
+
+All four backends produce identical tokens. The llama.cpp numbers are lower than the 284 / 50.9 recorded earlier
+in this file; those were a different session, which is why this table is measured back to back.
+
+Correctness: on 0.6B, logits after the prompt are within 1.8% relative L2 of a NumPy FP32 forward pass over the
+same dequantized weights, with the same argmax (`tests/test_gguf.py`). The generated text matches llama.cpp for six
+tokens, then splits at a near-tie (" France" 16.64 vs " Italy" 16.51 in our logits; 16.61 vs 16.55 in the FP32
+reference). The FP32 reference picks " France", as AdaKernel does; llama.cpp picks " Italy".
+
+What this says:
+
+- On 8B, decode is memory-bound and both runtimes sit on the same wall: 4.67 GB of weights per token. The dp4a
+  GEMVs reach about 230 GB/s (85% of 272 GB/s); llama.cpp's whole token implies at least 228 GB/s. The remaining
+  3% gap is GEMV efficiency and launch gaps between about 470 graph nodes.
+- On 0.6B, AdaKernel's CUDA graph beats llama.cpp by 6%: matrices are small, so the fused small ops (residual +
+  RMSNorm + quantize, QK-norm + RoPE + KV write, attention writing int8, SiLU + quantize, split argmax) matter.
+- The persistent device-side scheduler (the megakernel) is the slowest backend on real models. Best chunk size is
+  128 rows: 192 tok/s on 0.6B, 42 on 8B. Each extra task costs about 0.5 us of wall time (atomic ticket, atomic
+  predecessor decrements, atomic completion count), and that bookkeeping outweighs the overlap it buys once the
+  kernels themselves are fast. Its earlier wins in Table C were against slow FP32 kernels on synthetic models.
+
+Chunk sweep, hybrid backend, 64 decode tokens:
+
+| Chunk rows | 0.6B tasks | 0.6B tok/s | 8B tasks | 8B tok/s |
+| --- | --- | --- | --- | --- |
+| 32 | 16185 | 93 | 50293 | 28.1 |
+| 64 | 8435 | 148 | 26031 | 41.1 |
+| 128 | 4560 | 192 | 13900 | 42.0 |
+| 256 | 2623 | 174 | 7835 | 36.5 |
+| 512 | 1654 | 124 | 4802 | 29.0 |
+
+Per-op GPU time for one eager 8B step before the fused ops (about 100 cached positions): attention 22.9 ms over
+1152 single-head launches, Q4_K GEMV 15.4 ms, Q6_K GEMV 5.5 ms, every other op under 1 ms. The rewritten attention
+(warp per key, coalesced K loads, int8 output) and one grid launch for all heads removed most of the first item.
+
 ## Answers
 
 1. **Is the persistent scheduler faster than a CUDA Graph for single-token decode on this 4060?** Yes for the three synthetic models. The medium gap is 1153 vs 159 tok/s. It is not faster for a serial chain of empty kernels: the graph replay costs 0.58 us per empty kernel and the persistent chain costs 1.76 us.
