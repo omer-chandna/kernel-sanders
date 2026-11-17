@@ -22,6 +22,8 @@ add_library(adakernel SHARED
     native/cuda/prefill.cu
     native/cuda/test_api.cu
     native/cuda/bench.cu
+    native/cuda/qwen35_bench.cu
+    native/cuda/gguf_model.cu
 )
 target_include_directories(adakernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(adakernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/native/cuda)
