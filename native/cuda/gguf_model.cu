@@ -27,11 +27,14 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <unordered_map>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+constexpr int kSpecCols = 9;  // must match kMaxCols in the speculative section
 
 enum { kGgufF32 = 0, kGgufQ8 = 8, kGgufQ4K = 12, kGgufQ6K = 14 };
 
@@ -226,6 +229,9 @@ struct ak_gguf_model {
     int8_t *hq = nullptr, *aq = nullptr, *fq = nullptr;
     float *hd_s = nullptr, *ad_s = nullptr, *fd_s = nullptr;
     unsigned long long* d_best = nullptr;
+    unsigned long long* d_vbest = nullptr;  // per verify column
+    int *d_vtok = nullptr, *d_vout = nullptr;
+    std::unordered_map<int, cudaGraphExec_t> verify_graphs;
     int *d_token = nullptr, *d_pos = nullptr, *d_sample = nullptr, *d_out = nullptr, *d_count = nullptr;
     std::vector<void*> mem;
     size_t total_alloc = 0;
@@ -330,6 +336,22 @@ void emit_step(ak_gguf_model* m, Rec& rec, int chunk) {
         }
         return ids;
     };
+    // Same type and K, and the first matrix's rows a multiple of the grid kernel's rows per block (8).
+    auto pairable = [&](const QMat& a, const QMat& b) { return a.type == b.type && a.K == b.K && (a.rows % 8) == 0; };
+    auto gemv_pair = [&](const QMat& A, const QMat& B, const int8_t* xq, const float* xd, float* y,
+                         const std::vector<int>& preds) {
+        ak_task t{};
+        t.op = A.type == 0 ? AK_OP_Q8_DP4A : (A.type == 1 ? AK_OP_Q4K_DP4A : AK_OP_Q6K_DP4A);
+        t.p0 = reinterpret_cast<uint64_t>(A.w);
+        t.p1 = reinterpret_cast<uint64_t>(xq);
+        t.p2 = reinterpret_cast<uint64_t>(y);
+        t.p3 = reinterpret_cast<uint64_t>(xd);
+        t.p4 = reinterpret_cast<uint64_t>(B.w);
+        t.n0 = A.rows + B.rows;
+        t.n1 = A.K;
+        t.n2 = A.rows;
+        return std::vector<int>{rec.add(t, preds)};
+    };
     auto add_norm_quant = [&](const float* res, const float* w, const std::vector<int>& preds) {
         ak_task t{};
         t.op = AK_OP_ADD_NORM_QUANT;
@@ -356,8 +378,15 @@ void emit_step(ak_gguf_model* m, Rec& rec, int chunk) {
     for (int l = 0; l < m->n_layers; ++l) {
         const QLayer& ly = m->layers[l];
         const int nq = add_norm_quant(pending, ly.attn_norm, prev);
-        const auto q_ids = gemv(ly.wq, m->hq, m->hd_s, m->q, {nq});
-        const auto k_ids = gemv(ly.wk, m->hq, m->hd_s, m->k, {nq});
+        std::vector<int> q_ids, k_ids;
+        if (!chunked && pairable(ly.wq, ly.wk)) {
+            // One launch for Q and K: k sits right after q in memory.
+            q_ids = gemv_pair(ly.wq, ly.wk, m->hq, m->hd_s, m->q, {nq});
+            k_ids = q_ids;
+        } else {
+            q_ids = gemv(ly.wq, m->hq, m->hd_s, m->q, {nq});
+            k_ids = gemv(ly.wk, m->hq, m->hd_s, m->k, {nq});
+        }
         const auto v_ids = gemv(ly.wv, m->hq, m->hd_s, m->v, {nq});
 
         ak_task qr{};
@@ -412,10 +441,14 @@ void emit_step(ak_gguf_model* m, Rec& rec, int chunk) {
         }
         const auto o_ids = gemv(ly.wo, m->aq, m->ad_s, m->proj, heads);
         const int n2 = add_norm_quant(m->proj, ly.ffn_norm, o_ids);
-        const auto g_ids = gemv(ly.wgate, m->hq, m->hd_s, m->gate, {n2});
-        const auto u_ids = gemv(ly.wup, m->hq, m->hd_s, m->up, {n2});
-        std::vector<int> gu = g_ids;
-        gu.insert(gu.end(), u_ids.begin(), u_ids.end());
+        std::vector<int> gu;
+        if (!chunked && pairable(ly.wgate, ly.wup)) {
+            gu = gemv_pair(ly.wgate, ly.wup, m->hq, m->hd_s, m->gate, {n2});
+        } else {
+            gu = gemv(ly.wgate, m->hq, m->hd_s, m->gate, {n2});
+            const auto u_ids = gemv(ly.wup, m->hq, m->hd_s, m->up, {n2});
+            gu.insert(gu.end(), u_ids.begin(), u_ids.end());
+        }
         std::vector<int> silu_ids;
         const int sstep = chunked ? silu_chunk : m->ff;
         for (int i = 0; i < m->ff; i += sstep) {
@@ -634,6 +667,7 @@ extern "C" ak_status ak_gguf_destroy(ak_gguf_model* m) {
     if (m->stream) cudaStreamSynchronize(m->stream);
     if (m->graph_exec) cudaGraphExecDestroy(m->graph_exec);
     if (m->graph) cudaGraphDestroy(m->graph);
+    for (auto& kv : m->verify_graphs) cudaGraphExecDestroy(kv.second);
     if (m->persist_ready) ak_persist_free(&m->persist);
     for (void* p : m->mem) cudaFree(p);
     if (m->stream) cudaStreamDestroy(m->stream);
@@ -726,25 +760,32 @@ extern "C" ak_status ak_gguf_load(const char* path, int max_seq, int chunk_rows,
         if (st == AK_OK) st = galloc_n(m, &ly.vc, kv);
     }
     const int kmax = std::max(m->d, std::max(m->ff, q_rows));
-    if (st == AK_OK) st = galloc_n(m, &m->x, m->d);
+    // Activations hold kSpecCols columns for the speculative verify pass; one-token decode uses column 0.
+    const size_t C = kSpecCols;
+    if (st == AK_OK) st = galloc_n(m, &m->x, C * m->d);
     if (st == AK_OK) st = galloc_n(m, &m->h, m->d);
-    if (st == AK_OK) st = galloc_n(m, &m->q, q_rows);
-    if (st == AK_OK) st = galloc_n(m, &m->k, kv_rows);
-    if (st == AK_OK) st = galloc_n(m, &m->v, kv_rows);
+    // q|k and gate|up are contiguous so a paired GEMV writes both with one launch.
+    if (st == AK_OK) st = galloc_n(m, &m->q, C * (static_cast<size_t>(q_rows) + kv_rows));
+    if (st == AK_OK) m->k = m->q + q_rows;
+    if (st == AK_OK) st = galloc_n(m, &m->v, C * kv_rows);
     if (st == AK_OK) st = galloc_n(m, &m->attn, q_rows);
-    if (st == AK_OK) st = galloc_n(m, &m->proj, m->d);
-    if (st == AK_OK) st = galloc_n(m, &m->gate, m->ff);
-    if (st == AK_OK) st = galloc_n(m, &m->up, m->ff);
+    if (st == AK_OK) st = galloc_n(m, &m->proj, C * m->d);
+    if (st == AK_OK) st = galloc_n(m, &m->gate, C * 2 * static_cast<size_t>(m->ff));
+    if (st == AK_OK) m->up = m->gate + m->ff;
     if (st == AK_OK) st = galloc_n(m, &m->ffn, m->ff);
-    if (st == AK_OK) st = galloc_n(m, &m->logits, m->vocab);
-    if (st == AK_OK) st = galloc_n(m, &m->scores, static_cast<size_t>(m->n_heads) * m->max_seq);
-    if (st == AK_OK) st = galloc_n(m, &m->hq, kmax);
-    if (st == AK_OK) st = galloc_n(m, &m->aq, kmax);
-    if (st == AK_OK) st = galloc_n(m, &m->fq, kmax);
-    if (st == AK_OK) st = galloc_n(m, &m->hd_s, kmax / 32);
-    if (st == AK_OK) st = galloc_n(m, &m->ad_s, kmax / 32);
-    if (st == AK_OK) st = galloc_n(m, &m->fd_s, kmax / 32);
+    if (st == AK_OK) st = galloc_n(m, &m->logits, C * m->vocab);
+    if (st == AK_OK) st = galloc_n(m, &m->scores, C * m->n_heads * m->max_seq);
+    if (st == AK_OK) st = galloc_n(m, &m->hq, C * kmax);
+    if (st == AK_OK) st = galloc_n(m, &m->aq, C * kmax);
+    if (st == AK_OK) st = galloc_n(m, &m->fq, C * kmax);
+    if (st == AK_OK) st = galloc_n(m, &m->hd_s, C * kmax / 32);
+    if (st == AK_OK) st = galloc_n(m, &m->ad_s, C * kmax / 32);
+    if (st == AK_OK) st = galloc_n(m, &m->fd_s, C * kmax / 32);
     if (st == AK_OK) st = galloc_n(m, &m->d_best, 1);
+    if (st == AK_OK) st = galloc_n(m, &m->d_vbest, C);
+    if (st == AK_OK) st = galloc_n(m, &m->d_vtok, C);
+    if (st == AK_OK) st = galloc_n(m, &m->d_vout, C);
+    if (st == AK_OK) st = ck(cudaMemset(m->d_vbest, 0, sizeof(unsigned long long) * C));
     if (st == AK_OK) st = galloc_n(m, &m->d_token, 1);
     if (st == AK_OK) st = galloc_n(m, &m->d_pos, 1);
     if (st == AK_OK) st = galloc_n(m, &m->d_sample, 1);
@@ -888,5 +929,326 @@ extern "C" ak_status ak_gguf_logits(ak_gguf_model* m, const int32_t* prompt, int
     if (st == AK_OK) st = run_prompt(m, prompt, n_prompt, backend, nullptr);
     if (st == AK_OK) st = check_persist(m, backend);
     if (st == AK_OK) st = ck(cudaMemcpy(logits, m->logits, sizeof(float) * m->vocab, cudaMemcpyDeviceToHost));
+    return st;
+}
+
+// =====================================================================================================
+// Speculative decoding.
+//
+// verify: T tokens at positions pos .. pos + T - 1 (pos = *d_pos, not advanced) go through every layer together.
+// Each weight matrix is read once for all T tokens (qgemv_dp4a_rows_mc). Token c attends to positions
+// <= pos + c, so the pass is causal, and it writes the KV cache for all T positions. Output: greedy argmax for
+// each of the T positions in d_vout.
+//
+// Per column the math is the single-token path's (same kernels for norms, RoPE, attention; the multi-column
+// GEMV keeps each column's summation order), so verify's argmax for a column equals what one-token decode
+// would have produced at that position. Speculative greedy output is therefore identical to plain greedy.
+// =====================================================================================================
+
+namespace {
+
+constexpr int kMaxCols = 9;  // verify width: up to 8 drafted tokens plus the current one
+
+__global__ void spec_embed_cols(const uint8_t* table, int type, const int* tokens, float* x, int d) {
+    akd::embed_q_row(table, type, tokens + blockIdx.x, x + static_cast<size_t>(blockIdx.x) * d, d);
+}
+
+__global__ void spec_add_norm_quant_cols(float* x, const float* res, const float* w, int8_t* xq, float* xd, int d,
+                                         float eps) {
+    const size_t c = blockIdx.x;
+    akd::add_rmsnorm_quant(x + c * d, res ? res + c * d : nullptr, w, xq + c * d, xd + c * (d / 32), d, eps);
+}
+
+// grid (ceil(n_heads / 8), T). Column c sits at position *pos + c.
+__global__ void spec_qk_norm_rope_cols(float* q, int qstride, const float* w, int n_heads, int hd, float eps,
+                                       const int* pos, float theta, float* kc, const float* v, int vstride, float* vc,
+                                       int max_seq) {
+    const int c = blockIdx.y;
+    const int h0 = blockIdx.x * (blockDim.x >> 5);
+    if (h0 >= n_heads) return;
+    const int nh = min(n_heads - h0, static_cast<int>(blockDim.x >> 5));
+    akd::qk_norm_rope_range(q + static_cast<size_t>(c) * qstride, w, h0, nh, n_heads, hd, eps, pos, theta, kc,
+                            v ? v + static_cast<size_t>(c) * vstride : nullptr, vc, max_seq, c);
+}
+
+// grid (n_heads, T)
+__global__ void spec_attn_cols(const float* q, int qstride, const float* kc, const float* vc, int8_t* aq, float* ad,
+                               float* scores, int n_rep, int hd, int max_seq, int n_kv, const int* pos) {
+    const int head = blockIdx.x;
+    const int c = blockIdx.y;
+    const int n_heads = gridDim.x;
+    int seq = *pos + c + 1;
+    if (seq < 1) seq = 1;
+    if (seq > max_seq) seq = max_seq;
+    const size_t arow = static_cast<size_t>(c) * n_heads * hd;
+    akd::attn_decode_head(q + static_cast<size_t>(c) * qstride + head * hd, kc, vc, aq + arow + head * hd,
+                          ad + arow / 32 + head * (hd / 32),
+                          scores + (static_cast<size_t>(c) * n_heads + head) * max_seq, head / n_rep, hd, seq, n_kv);
+}
+
+// grid (ceil(ff / 256), T); gate|up rows are [gate(ff) | up(ff)] per column.
+__global__ void spec_silu_quant_cols(const float* gu, int ff, int8_t* fq, float* fd) {
+    const int c = blockIdx.y;
+    const int lo = blockIdx.x * 256;
+    if (lo >= ff) return;
+    const float* g = gu + static_cast<size_t>(c) * 2 * ff;
+    const size_t o = static_cast<size_t>(c) * ff + lo;
+    akd::silu_quant(g + lo, g + ff + lo, fq + o, fd + o / 32, min(256, ff - lo));
+}
+
+// grid (ceil(vocab / 4096), T)
+__global__ void spec_argmax_cols(const float* logits, int vocab, unsigned long long* best) {
+    const int c = blockIdx.y;
+    const int lo = blockIdx.x * 4096;
+    if (lo >= vocab) return;
+    akd::argmax_part(logits + static_cast<size_t>(c) * vocab + lo, min(4096, vocab - lo), lo, best + c);
+}
+
+__global__ void spec_finish_cols(unsigned long long* best, int T, int* out) {
+    const int c = threadIdx.x;
+    if (c < T) {
+        out[c] = akd::argmax_key_index(best[c]);
+        best[c] = 0ull;
+    }
+}
+
+template <int type, int NC>
+__global__ void __launch_bounds__(128, 8) spec_gemv_mc(const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq, const float* xd,
+                             float* y, int ystride, int rows, int K) {
+    constexpr int bb = type == 0 ? 34 : (type == 1 ? 144 : 210);
+    const int nb = type == 0 ? (K >> 5) : (K >> 8);
+    const int per_block = (blockDim.x >> 5) * akd::qgemv_rows_per_warp(type);
+    const int row0 = blockIdx.x * per_block;
+    if (row0 >= rows) return;
+    const int nrows = min(rows - row0, per_block);
+    const uint8_t* base = W;
+    int wrow = row0;
+    if (W2 && row0 >= rows1) {
+        base = W2;
+        wrow = row0 - rows1;
+    }
+    akd::qgemv_dp4a_rows_mc<type, NC>(base + static_cast<size_t>(wrow) * nb * bb, xq, xd, y + row0, ystride, nrows, K);
+}
+
+template <int type>
+void launch_gemv_mc_t(int nc, const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq, const float* xd,
+                      float* y, int ystride, int rows, int K, cudaStream_t s) {
+    const int threads = 128;
+    const int per_block = (threads >> 5) * akd::qgemv_rows_per_warp(type);
+    const int blocks = (rows + per_block - 1) / per_block;
+#define AK_MC(N) \
+    case N: spec_gemv_mc<type, N><<<blocks, threads, 0, s>>>(W, W2, rows1, xq, xd, y, ystride, rows, K); break;
+    switch (nc) {
+        AK_MC(1) AK_MC(2) AK_MC(3) AK_MC(4) AK_MC(5) AK_MC(6) AK_MC(7) AK_MC(8) AK_MC(9)
+        default: break;
+    }
+#undef AK_MC
+}
+
+// y[c * ystride + r] = (A | B) row r . x_c ; B optional (same type and K), rows of B follow A's.
+void launch_gemv_mc(int nc, const QMat& A, const QMat* B, const int8_t* xq, const float* xd, float* y, int ystride,
+                    cudaStream_t s) {
+    const int rows = A.rows + (B ? B->rows : 0);
+    const uint8_t* W2 = B ? B->w : nullptr;
+    if (A.type == 0) launch_gemv_mc_t<0>(nc, A.w, W2, A.rows, xq, xd, y, ystride, rows, A.K, s);
+    else if (A.type == 1) launch_gemv_mc_t<1>(nc, A.w, W2, A.rows, xq, xd, y, ystride, rows, A.K, s);
+    else launch_gemv_mc_t<2>(nc, A.w, W2, A.rows, xq, xd, y, ystride, rows, A.K, s);
+}
+
+bool pair_ok(const QMat& a, const QMat& b) { return a.type == b.type && a.K == b.K && (a.rows % 8) == 0; }
+
+ak_status launch_verify(ak_gguf_model* m, int T, cudaStream_t s) {
+    const int d = m->d;
+    const int q_rows = m->n_heads * m->hd;
+    const int kv_rows = m->n_kv * m->hd;
+    const int qk_stride = q_rows + kv_rows;
+    const int n_rep = m->n_heads / m->n_kv;
+    float theta = m->theta;
+    spec_embed_cols<<<T, akd::kThreads, 0, s>>>(m->embd.w, m->embd.type, m->d_vtok, m->x, d);
+    const float* pending = nullptr;
+    for (int l = 0; l < m->n_layers; ++l) {
+        const QLayer& ly = m->layers[l];
+        spec_add_norm_quant_cols<<<T, akd::kThreads, 0, s>>>(m->x, pending, ly.attn_norm, m->hq, m->hd_s, d, m->eps);
+        if (pair_ok(ly.wq, ly.wk)) {
+            launch_gemv_mc(T, ly.wq, &ly.wk, m->hq, m->hd_s, m->q, qk_stride, s);
+        } else {
+            launch_gemv_mc(T, ly.wq, nullptr, m->hq, m->hd_s, m->q, qk_stride, s);
+            launch_gemv_mc(T, ly.wk, nullptr, m->hq, m->hd_s, m->q + q_rows, qk_stride, s);
+        }
+        launch_gemv_mc(T, ly.wv, nullptr, m->hq, m->hd_s, m->v, kv_rows, s);
+        spec_qk_norm_rope_cols<<<dim3((m->n_heads + 7) / 8, T), akd::kThreads, 0, s>>>(
+            m->q, qk_stride, ly.q_norm, m->n_heads, m->hd, m->eps, m->d_pos, theta, nullptr, nullptr, 0, nullptr,
+            m->max_seq);
+        spec_qk_norm_rope_cols<<<dim3((m->n_kv + 7) / 8, T), akd::kThreads, 0, s>>>(
+            m->q + q_rows, qk_stride, ly.k_norm, m->n_kv, m->hd, m->eps, m->d_pos, theta, ly.kc, m->v, kv_rows, ly.vc,
+            m->max_seq);
+        spec_attn_cols<<<dim3(m->n_heads, T), akd::kThreads, 0, s>>>(m->q, qk_stride, ly.kc, ly.vc, m->aq, m->ad_s,
+                                                                     m->scores, n_rep, m->hd, m->max_seq, m->n_kv,
+                                                                     m->d_pos);
+        launch_gemv_mc(T, ly.wo, nullptr, m->aq, m->ad_s, m->proj, d, s);
+        spec_add_norm_quant_cols<<<T, akd::kThreads, 0, s>>>(m->x, m->proj, ly.ffn_norm, m->hq, m->hd_s, d, m->eps);
+        if (pair_ok(ly.wgate, ly.wup)) {
+            launch_gemv_mc(T, ly.wgate, &ly.wup, m->hq, m->hd_s, m->gate, 2 * m->ff, s);
+        } else {
+            launch_gemv_mc(T, ly.wgate, nullptr, m->hq, m->hd_s, m->gate, 2 * m->ff, s);
+            launch_gemv_mc(T, ly.wup, nullptr, m->hq, m->hd_s, m->gate + m->ff, 2 * m->ff, s);
+        }
+        spec_silu_quant_cols<<<dim3((m->ff + 255) / 256, T), akd::kThreads, 0, s>>>(m->gate, m->ff, m->fq, m->fd_s);
+        launch_gemv_mc(T, ly.wdown, nullptr, m->fq, m->fd_s, m->proj, d, s);
+        pending = m->proj;
+    }
+    spec_add_norm_quant_cols<<<T, akd::kThreads, 0, s>>>(m->x, pending, m->out_norm, m->hq, m->hd_s, d, m->eps);
+    launch_gemv_mc(T, m->out, nullptr, m->hq, m->hd_s, m->logits, m->vocab, s);
+    spec_argmax_cols<<<dim3((m->vocab + 4095) / 4096, T), akd::kThreads, 0, s>>>(m->logits, m->vocab, m->d_vbest);
+    spec_finish_cols<<<1, 32, 0, s>>>(m->d_vbest, T, m->d_vout);
+    return ck(cudaGetLastError());
+}
+
+ak_status verify_graph(ak_gguf_model* m, int T, cudaGraphExec_t* out) {
+    auto it = m->verify_graphs.find(T);
+    if (it != m->verify_graphs.end()) {
+        *out = it->second;
+        return AK_OK;
+    }
+    cudaGraph_t g = nullptr;
+    ak_status st = ck(cudaStreamSynchronize(m->stream));
+    if (st == AK_OK) st = ck(cudaStreamBeginCapture(m->stream, cudaStreamCaptureModeGlobal));
+    if (st != AK_OK) return st;
+    st = launch_verify(m, T, m->stream);
+    cudaError_t end = cudaStreamEndCapture(m->stream, &g);
+    if (st != AK_OK) {
+        cudaGetLastError();
+        if (g) cudaGraphDestroy(g);
+        return st;
+    }
+    if (end != cudaSuccess) return ck(end);
+    cudaGraphExec_t exec = nullptr;
+    st = ck(cudaGraphInstantiate(&exec, g, 0));
+    cudaGraphDestroy(g);
+    if (st != AK_OK) return st;
+    m->verify_graphs[T] = exec;
+    *out = exec;
+    return AK_OK;
+}
+
+ak_status set_pos(ak_gguf_model* m, int pos) {
+    return ck(cudaMemcpyAsync(m->d_pos, &pos, sizeof(int), cudaMemcpyHostToDevice, m->stream));
+}
+
+// Greedy-verify T tokens at positions pos..pos+T-1; out[c] = argmax after token c. KV for those positions is
+// written; d_pos is left at pos.
+ak_status verify(ak_gguf_model* m, int pos, const int32_t* tokens, int T, int32_t* out) {
+    if (T < 1 || T > kMaxCols || pos + T > m->max_seq) {
+        ak_set_error("verify: T out of range or past max_seq");
+        return AK_ERR_INVALID;
+    }
+    cudaGraphExec_t g = nullptr;
+    ak_status st = verify_graph(m, T, &g);
+    if (st == AK_OK) st = set_pos(m, pos);
+    if (st == AK_OK) st = ck(cudaMemcpyAsync(m->d_vtok, tokens, sizeof(int) * T, cudaMemcpyHostToDevice, m->stream));
+    if (st == AK_OK) st = ck(cudaGraphLaunch(g, m->stream));
+    if (st == AK_OK) st = ck(cudaMemcpyAsync(out, m->d_vout, sizeof(int) * T, cudaMemcpyDeviceToHost, m->stream));
+    if (st == AK_OK) st = ck(cudaStreamSynchronize(m->stream));
+    return st;
+}
+
+// Single-token decode chain on the cuda-graph backend: feed `first` at `pos`, then keep feeding the model's own
+// greedy token. out[i] is the token predicted after i + 1 fed tokens. Leaves d_pos at pos + n.
+ak_status decode_chain(ak_gguf_model* m, int pos, int first, int n, int32_t* out) {
+    const int one = 1;
+    const int zero = 0;
+    ak_status st = set_pos(m, pos);
+    if (st == AK_OK) st = ck(cudaMemcpyAsync(m->d_token, &first, sizeof(int), cudaMemcpyHostToDevice, m->stream));
+    if (st == AK_OK) st = ck(cudaMemcpyAsync(m->d_sample, &one, sizeof(int), cudaMemcpyHostToDevice, m->stream));
+    if (st == AK_OK) st = ck(cudaMemcpyAsync(m->d_count, &zero, sizeof(int), cudaMemcpyHostToDevice, m->stream));
+    for (int i = 0; i < n && st == AK_OK; ++i) st = step(m, AK_BACKEND_CUDA_GRAPH, nullptr);
+    if (st == AK_OK && n > 0) st = ck(cudaMemcpyAsync(out, m->d_out, sizeof(int) * n, cudaMemcpyDeviceToHost, m->stream));
+    if (st == AK_OK) st = ck(cudaStreamSynchronize(m->stream));
+    return st;
+}
+
+}  // namespace
+
+extern "C" ak_status ak_gguf_verify(ak_gguf_model* m, int pos, const int32_t* tokens, int n_tokens, int32_t* out) {
+    if (!m || !tokens || !out) {
+        ak_set_error("gguf verify: bad arguments");
+        return AK_ERR_INVALID;
+    }
+    return verify(m, pos, tokens, n_tokens, out);
+}
+
+extern "C" ak_status ak_gguf_speculate(ak_gguf_model* target, ak_gguf_model* draft, const int32_t* prompt, int n_prompt,
+                                       int32_t* out_tokens, int n_gen, int n_draft, ak_spec_stats* stats) {
+    if (!target || !draft || !prompt || n_prompt < 1 || !out_tokens || n_gen < 1 || n_draft < 1 ||
+        n_draft + 1 > kMaxCols) {
+        ak_set_error("gguf speculate: bad arguments (n_draft must be 1..8)");
+        return AK_ERR_INVALID;
+    }
+    if (target->vocab != draft->vocab) {
+        ak_set_error("gguf speculate: target and draft vocabularies differ");
+        return AK_ERR_INVALID;
+    }
+    const int need = n_prompt + n_gen + n_draft + 1;
+    if (need > target->max_seq || need > draft->max_seq) {
+        ak_set_error("gguf speculate: prompt + generation + draft exceeds max_seq");
+        return AK_ERR_INVALID;
+    }
+    if (stats) std::memset(stats, 0, sizeof(*stats));
+    const auto t0 = std::chrono::steady_clock::now();
+    // Prompt through both models, one token at a time (graph backend). The target's greedy token after the
+    // prompt is the first generated token.
+    ak_status st = reset_state(target);
+    if (st == AK_OK) st = reset_state(draft);
+    if (st == AK_OK) st = run_prompt(target, prompt, n_prompt, AK_BACKEND_CUDA_GRAPH, nullptr);
+    if (st == AK_OK) st = run_prompt(draft, prompt, n_prompt, AK_BACKEND_CUDA_GRAPH, nullptr);
+    int cur = 0;
+    if (st == AK_OK) st = ck(cudaMemcpy(&cur, target->d_out, sizeof(int), cudaMemcpyDeviceToHost));
+    if (st != AK_OK) return st;
+    const auto t1 = std::chrono::steady_clock::now();
+
+    int emitted = 0;
+    out_tokens[emitted++] = cur;
+    int P = n_prompt;  // both models have the KV for positions < P; cur is not yet fed
+    int rounds = 0, drafted = 0, accepted = 0;
+    int32_t dtok[kMaxCols] = {0};
+    int32_t vin[kMaxCols] = {0};
+    int32_t vout[kMaxCols] = {0};
+    while (emitted < n_gen && st == AK_OK) {
+        const int k = n_draft;
+        st = decode_chain(draft, P, cur, k, dtok);  // dtok[i] = draft token i+1
+        if (st != AK_OK) break;
+        vin[0] = cur;
+        for (int i = 0; i < k; ++i) vin[i + 1] = dtok[i];
+        st = verify(target, P, vin, k + 1, vout);  // vout[j] = target's token after vin[0..j]
+        if (st != AK_OK) break;
+        int n = 0;
+        while (n < k && dtok[n] == vout[n]) ++n;
+        for (int i = 0; i < n && emitted < n_gen; ++i) out_tokens[emitted++] = dtok[i];
+        if (emitted < n_gen) out_tokens[emitted++] = vout[n];
+        if (n == k) {
+            // The draft never fed its own last token; feed it so its KV covers position P + k.
+            int32_t ignore = 0;
+            st = decode_chain(draft, P + k, dtok[k - 1], 1, &ignore);
+        }
+        ++rounds;
+        drafted += k;
+        accepted += n;
+        P += n + 1;
+        cur = vout[n];
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->status = st;
+        stats->rounds = rounds;
+        stats->drafted = drafted;
+        stats->accepted = accepted;
+        stats->generated = emitted;
+        stats->prompt_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        stats->decode_ms = std::chrono::duration<float, std::milli>(t2 - t1).count();
+        // The first token comes from the prompt pass; rate over the rest, like ak_gguf_generate.
+        stats->decode_tps = stats->decode_ms > 0 && emitted > 1 ? (emitted - 1) * 1000.f / stats->decode_ms : 0.f;
+        stats->acceptance = drafted > 0 ? static_cast<float>(accepted) / drafted : 0.f;
+        stats->tokens_per_round = rounds > 0 ? static_cast<float>(emitted - 1) / rounds : 0.f;
+    }
     return st;
 }

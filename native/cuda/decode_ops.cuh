@@ -53,16 +53,18 @@ __device__ __forceinline__ void silu_quant(const float* gate, const float* up, i
 
 // Per-head RMSNorm then NeoX RoPE, one warp per head. With kc set, the rotated heads and v are also appended to
 // the KV cache at *pos (layout [max_seq][n_heads][hd]). hd must be a multiple of 64 and at most 256.
-__device__ __forceinline__ void qk_norm_rope(float* q, const float* w, int n_heads, int hd, float eps, const int* pos_p,
-                                             float theta, float* kc, const float* v, float* vc, int max_seq) {
+// Heads [h0, h0 + nh) of n_heads; the cache layout uses n_heads. qk_norm_rope below covers every head.
+__device__ __forceinline__ void qk_norm_rope_range(float* q, const float* w, int h0, int nh, int n_heads, int hd,
+                                                   float eps, const int* pos_p, float theta, float* kc, const float* v,
+                                                   float* vc, int max_seq, int pos_add = 0) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int nwarps = blockDim.x >> 5;
-    const int pos = *pos_p;
+    const int pos = *pos_p + pos_add;
     const int nj = hd >> 5;
     const int hj = nj >> 1;
     const bool store = kc && pos >= 0 && pos < max_seq;
-    for (int h = warp; h < n_heads; h += nwarps) {
+    for (int h = h0 + warp; h < h0 + nh; h += nwarps) {
         float* row = q + h * hd;
         float vals[8];
         float ss = 0.f;
@@ -106,6 +108,11 @@ __device__ __forceinline__ void qk_norm_rope(float* q, const float* w, int n_hea
         }
     }
     __syncthreads();
+}
+
+__device__ __forceinline__ void qk_norm_rope(float* q, const float* w, int n_heads, int hd, float eps, const int* pos_p,
+                                             float theta, float* kc, const float* v, float* vc, int max_seq) {
+    qk_norm_rope_range(q, w, 0, n_heads, n_heads, hd, eps, pos_p, theta, kc, v, vc, max_seq);
 }
 
 // One query head against the cache, output written as Q8_1 blocks (oq[hd], od[hd / 32]).

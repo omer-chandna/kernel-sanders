@@ -43,6 +43,21 @@ class GgufInfo(ctypes.Structure):
     ]
 
 
+class SpecStats(ctypes.Structure):
+    _fields_ = [
+        ("status", ctypes.c_int32),
+        ("rounds", ctypes.c_int32),
+        ("drafted", ctypes.c_int32),
+        ("accepted", ctypes.c_int32),
+        ("generated", ctypes.c_int32),
+        ("prompt_ms", ctypes.c_float),
+        ("decode_ms", ctypes.c_float),
+        ("decode_tps", ctypes.c_float),
+        ("acceptance", ctypes.c_float),
+        ("tokens_per_round", ctypes.c_float),
+    ]
+
+
 def _bind(lib) -> None:
     if getattr(lib, "_gguf_bound", False):
         return
@@ -57,6 +72,10 @@ def _bind(lib) -> None:
     lib.ak_gguf_logits.restype = ctypes.c_int
     lib.ak_gguf_profile.argtypes = [vp, vp, vp]
     lib.ak_gguf_profile.restype = ctypes.c_int
+    lib.ak_gguf_verify.argtypes = [vp, ctypes.c_int, vp, ctypes.c_int, vp]
+    lib.ak_gguf_verify.restype = ctypes.c_int
+    lib.ak_gguf_speculate.argtypes = [vp, vp, vp, ctypes.c_int, vp, ctypes.c_int, ctypes.c_int, ctypes.POINTER(SpecStats)]
+    lib.ak_gguf_speculate.restype = ctypes.c_int
     lib._gguf_bound = True
 
 
@@ -111,6 +130,27 @@ class GgufModel:
             "persistent_blocks": stats.persistent_blocks,
             "vram_mb": stats.vram_peak_mb,
         }
+
+    def verify(self, pos: int, tokens) -> np.ndarray:
+        """Greedy argmax after each of `tokens` placed at positions pos.. (one pass, writes KV for them)."""
+        toks = np.ascontiguousarray(tokens, dtype=np.int32)
+        out = np.empty(toks.size, dtype=np.int32)
+        self.native.check(self.native.lib.ak_gguf_verify(self.handle, int(pos), Native._ptr(toks), int(toks.size), Native._ptr(out)))
+        return out
+
+    def speculate(self, draft: "GgufModel", prompt, n_gen: int, n_draft: int = 3) -> dict:
+        """Greedy speculative decoding with `draft` proposing n_draft tokens per round. Same tokens as greedy."""
+        tokens = np.ascontiguousarray(prompt, dtype=np.int32)
+        out = np.empty(n_gen, dtype=np.int32)
+        st = SpecStats()
+        self.native.check(
+            self.native.lib.ak_gguf_speculate(
+                self.handle, draft.handle, Native._ptr(tokens), int(tokens.size), Native._ptr(out), int(n_gen), int(n_draft), ctypes.byref(st)
+            )
+        )
+        r = {name: getattr(st, name) for name, _ in SpecStats._fields_}
+        r["tokens"] = out
+        return r
 
     OP_NAMES = {
         1: "rmsnorm", 2: "residual", 4: "rope", 6: "silu_mul", 7: "attn_head", 10: "embed", 12: "qk_norm",

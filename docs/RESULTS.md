@@ -126,6 +126,34 @@ see the same clocks. Prompt "The capital of France is" (5 tokens, fed one at a t
 All four backends produce identical tokens. The llama.cpp numbers are lower than the 284 / 50.9 recorded earlier
 in this file; those were a different session, which is why this table is measured back to back.
 
+Second session, after adding Qwen3-4B Q4_K_M (official `Qwen/Qwen3-4B-GGUF` at commit `bc64014`, 2,497,280,256
+bytes, SHA256 `7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5`, tied Q6_K embedding/output) and
+merging Q+K and gate+up into single GEMV launches on the graph path:
+
+| Model | llama.cpp tg128 | AdaKernel cuda-graph | eager | hybrid | ratio |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-0.6B Q8_0 | 276.8 (sd 0.3) | 274.5 (270.9-275.9) | 243.5 | 171.0 | 0.99 |
+| Qwen3-4B Q4_K_M | 84.4 (sd 0.3) | **86.3** (84.9-86.3) | 82.1 | 66.8 | 1.02 |
+| Qwen3-8B Q4_K_M | **49.9** (sd 0.35) | 48.3 (48.0-48.4) | 47.1 | 42.3 | 0.97 |
+
+llama.cpp itself moved 9-14% between the two sessions on 0.6B and 4B (GPU clock state), so only ratios measured in
+the same session are comparable. Across both sessions AdaKernel's CUDA graph path is within about 3-6% of llama.cpp
+on all three models, ahead on 4B both times and behind on 8B both times. Treat 0.6B as a tie.
+
+4B greedy text matches llama.cpp token for token over 32 tokens. Per-op GPU time for one eager 4B step at about 100
+positions: Q4_K GEMV 8.1 ms, Q6_K GEMV 3.0 ms, attention 0.84 ms, residual+norm+quantize 0.70 ms (single block,
+9.6 us each), QK-norm+RoPE 0.47 ms, everything else under 0.2 ms.
+
+Null results this session:
+
+- Half-warp rows for the K-quant GEMV (two super-blocks per pass, so K = 2560 has no idle lanes). Interleaved A/B in
+  one process: 4B 225.2 / 224.1 and 228.1 / 227.8 GB/s (whole warp / half warp), 8B 236.6 / 236.7 and
+  236.5 / 236.9. No difference. An earlier single run showing 200 -> 220 GB/s on 4B, and another showing 8B Q4_K at
+  171 GB/s, were GPU clock drift. Kept (harmless); `ak_bench_qwen35_projections` now reports both layouts
+  interleaved (`lpr32_gbps`, `lpr16_gbps`) so this stays checkable.
+- Q+K and gate+up as one GEMV launch each, QK-norm+RoPE as a multi-block grid: no gain against llama.cpp that rises
+  above the session-to-session noise. Kept: fewer launches, same tokens.
+
 Correctness: on 0.6B, logits after the prompt are within 1.8% relative L2 of a NumPy FP32 forward pass over the
 same dequantized weights, with the same argmax (`tests/test_gguf.py`). The generated text matches llama.cpp for six
 tokens, then splits at a near-tie (" France" 16.64 vs " Italy" 16.51 in our logits; 16.61 vs 16.55 in the FP32
@@ -156,6 +184,52 @@ Chunk sweep, hybrid backend, 64 decode tokens:
 Per-op GPU time for one eager 8B step before the fused ops (about 100 cached positions): attention 22.9 ms over
 1152 single-head launches, Q4_K GEMV 15.4 ms, Q6_K GEMV 5.5 ms, every other op under 1 ms. The rewritten attention
 (warp per key, coalesced K loads, int8 output) and one grid launch for all heads removed most of the first item.
+
+## Table F. Speculative decoding (Qwen3-0.6B Q8_0 drafting)
+
+`python -m benchmarks.spec_bench --target <file>`: four prompts (story, explanation, code, capital-cities facts),
+128 greedy tokens, median of 3. Greedy speculative decoding: the draft proposes k tokens, the target checks all
+k + 1 positions in one verify pass (`ak_gguf_verify`: every weight matrix is read once for all columns), the longest
+agreeing prefix is kept plus the target's own next token. Every run reproduced the target's plain greedy tokens
+exactly (checked per run, and in `tests/test_gguf.py`). JSON: `experiments/results/spec_<model>.json`.
+
+Speedup over plain greedy decoding of the same target, CUDA graph backend:
+
+| Target | greedy tok/s | k=2 | k=3 | k=4 | k=5 | k=6 | k=8 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-8B Q4_K_M | 48.9 | 1.62x | **1.76x** | 1.72x | 1.65x | 1.69x | 1.46x |
+| Qwen3-4B Q4_K_M | 87.5 | 1.28x | **1.36x** | 1.31x | 1.20x | 1.27x | 1.11x |
+
+Mean over the four prompts. Per prompt at k=3: 8B 1.56x (explain) to 2.05x (facts), 77-100 tok/s; 4B 1.11x
+(story) to 1.58x (facts), 98-139 tok/s. 8B gains more because a 0.6B draft step (about 3.5 ms) is a smaller share of
+its 20 ms step than of 4B's 11.5 ms one. k=3 is the default.
+
+Against llama.cpp's `llama-speculative` (same target, same 0.6B draft, `--spec-draft-n-max 3`, `-ngl 99 -ngld 99
+-fa on --temp 0`), same prompts, tok/s:
+
+| Target / prompt | llama.cpp speculative | AdaKernel k=3 | ratio |
+| --- | --- | --- | --- |
+| 8B story | 65.5 (accept 59%) | 77.4 | 1.18 |
+| 8B explain | 59.5 (50%) | 76.0 | 1.28 |
+| 8B code | 73.9 (72%) | 89.8 | 1.22 |
+| 8B facts | 80.4 (82%) | 100.3 | 1.25 |
+| 4B story | 77.1 (54%) | 97.5 | 1.26 |
+| 4B explain | 94.5 (77%) | 125.8 | 1.33 |
+| 4B code | 82.7 (61%) | 114.8 | 1.39 |
+| 4B facts | 96.5 (79%) | 138.8 | 1.44 |
+
+`llama-speculative` is llama.cpp's example program; llama-server's speculative path was not measured. JSON:
+`experiments/results/llamacpp_speculative.json`.
+
+Verify-pass cost against width T (tokens checked at once), ms, after capping the wide kernels at 64 registers:
+
+| Model | T=1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4B | 11.33 | 11.44 | 11.71 | 12.12 | 13.77 | 15.01 | 16.12 | 17.89 | 20.50 |
+| 8B | 20.34 | 20.47 | 20.89 | 21.56 | 23.90 | 26.37 | 28.61 | 31.96 | 36.36 |
+
+Checking 4 tokens costs 7% more than checking 1. Before the register cap (`__launch_bounds__(128, 8)`, no unroll in
+the wide variants), Q4_K at T >= 6 used 183-191 registers and T=6 cost 18.97 ms on 4B.
 
 ## Answers
 

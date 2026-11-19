@@ -104,16 +104,16 @@ __global__ void tile_q8(const uint8_t* W, const float* x, float* y, int rows, in
 
 constexpr int kFastThreads = 128;
 
-template <int T>
+template <int T, int LPR = 16>
 __global__ void fast_q(const uint8_t* W, const int8_t* xq, const float* xd, float* y, int rows, int K) {
     constexpr int bb = T == 0 ? 34 : (T == 1 ? 144 : 210);
     const int nb = T == 0 ? (K >> 5) : (K >> 8);
-    const int nwarps = blockDim.x >> 5;
-    const int row0 = blockIdx.x * nwarps;
+    const int per_block = (blockDim.x >> 5) * akd::qgemv_rows_per_warp(T, LPR);
+    const int row0 = blockIdx.x * per_block;
     if (row0 >= rows) return;
     int nrows = rows - row0;
-    if (nrows > nwarps) nrows = nwarps;
-    akd::qgemv_dp4a_rows<T>(W + static_cast<size_t>(row0) * nb * bb, xq, xd, y + row0, nrows, K);
+    if (nrows > per_block) nrows = per_block;
+    akd::qgemv_dp4a_rows<T, LPR>(W + static_cast<size_t>(row0) * nb * bb, xq, xd, y + row0, nrows, K);
 }
 
 void quant_x(const float* x, int8_t* xq, float* xd, int K) {
@@ -141,8 +141,20 @@ void launch_old(const Proj& p, const Bufs& b) {
     else tile_q8<<<blocks, 256>>>(w, b.x, b.y, p.rows, p.K);
 }
 
+template <int LPR>
+void launch_fast_lpr(const Proj& p, const Bufs& b) {
+    const int code = p.type == kQ4 ? 1 : (p.type == kQ6 ? 2 : 0);
+    const int rpb = (kFastThreads / 32) * akd::qgemv_rows_per_warp(code, LPR);
+    const int blocks = (p.rows + rpb - 1) / rpb;
+    const uint8_t* w = b.w + p.offset;
+    if (p.type == kQ4) fast_q<1, LPR><<<blocks, kFastThreads>>>(w, b.xq, b.xd, b.y, p.rows, p.K);
+    else if (p.type == kQ6) fast_q<2, LPR><<<blocks, kFastThreads>>>(w, b.xq, b.xd, b.y, p.rows, p.K);
+    else fast_q<0, LPR><<<blocks, kFastThreads>>>(w, b.xq, b.xd, b.y, p.rows, p.K);
+}
+
 void launch_fast(const Proj& p, const Bufs& b) {
-    const int rpb = kFastThreads / 32;
+    const int code = p.type == kQ4 ? 1 : (p.type == kQ6 ? 2 : 0);
+    const int rpb = (kFastThreads / 32) * akd::qgemv_rows_per_warp(code);
     const int blocks = (p.rows + rpb - 1) / rpb;
     const uint8_t* w = b.w + p.offset;
     if (p.type == kQ4) fast_q<1><<<blocks, kFastThreads>>>(w, b.xq, b.xd, b.y, p.rows, p.K);
@@ -330,6 +342,14 @@ extern "C" ak_status ak_bench_qwen35_projections(const char* path, int iters, ak
         const float ms = time_ms([&]() { for (const Proj& p : sub) launch_fast(p, bufs); }, iters);
         *per_type[ti] = static_cast<float>(gbps(bytes, ms));
     }
+    // Lanes-per-row A/B for the K-quants, interleaved so clock drift hits both equally.
+    double t32 = 0.0, t16 = 0.0;
+    for (int rep = 0; rep < 5; ++rep) {
+        t32 += time_ms([&]() { for (const Proj& p : proj) launch_fast_lpr<32>(p, bufs); }, iters);
+        t16 += time_ms([&]() { for (const Proj& p : proj) launch_fast_lpr<16>(p, bufs); }, iters);
+    }
+    out->lpr32_gbps = static_cast<float>(gbps(weight_bytes, static_cast<float>(t32 / 5)));
+    out->lpr16_gbps = static_cast<float>(gbps(weight_bytes, static_cast<float>(t16 / 5)));
     cudaFree(d_xq);
     cudaFree(d_xd);
     cudaFree(d_yref);

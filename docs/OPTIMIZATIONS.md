@@ -34,6 +34,12 @@ run each, 32 tokens). Tokens unchanged. Keep.
 
 **Persistent chunk size 128 for the GGUF runtime.** Sweep in `docs/RESULTS.md` Table E. Keep as default.
 
+**Speculative decoding with a multi-column verify pass (`ak_gguf_speculate`).** Hypothesis: at batch 1 the target
+is bandwidth-bound, so checking several drafted tokens per weight read is nearly free. Change: `qgemv_dp4a_rows_mc`
+dots up to 9 activation columns per weight load, sharing the per-column arithmetic with the one-token kernel so
+results are bit-identical; a T-column forward pass (`ak_gguf_verify`) with causal attention per column; the 0.6B
+model drafts with CUDA graph replays. 8B 1.76x, 4B 1.36x over greedy at k=3, exact greedy output. Keep.
+
 ## Reverted
 
 **Four-way float4 accumulator in the matvec.** Hypothesis: extra independent accumulators would hide load latency and raise the 27 GB/s single-block matvec. Result: registers rose from 56 to 66, resident blocks fell from 96 to 72, 1024x1024 matvec went from 91.1 us to 96.3 us, 4096 stayed at about 2390 us. No spill, but no win. Reverted. End-to-end was not re-measured after the microbenchmark loss.

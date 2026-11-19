@@ -45,7 +45,9 @@ enum {
     AK_OP_Q4K_MATVEC = 9,
     AK_OP_Q6K_MATVEC = 15,
     AK_OP_QUANT_Q8_1 = 16,   /* p0 = x (float), p1 = xq (int8), p3 = xd (float), n0 = K */
-    AK_OP_Q8_DP4A = 17,      /* p0 = W, p1 = xq, p2 = y, p3 = xd, n0 = rows, n1 = K */
+    AK_OP_Q8_DP4A = 17,      /* p0 = W, p1 = xq, p2 = y, p3 = xd, n0 = rows, n1 = K. Optional second matrix of
+                                the same type and K: p4 = W2, n2 = rows of W (W2 supplies rows n2..n0-1,
+                                written to y + n2..). One launch for Q+K or gate+up. */
     AK_OP_Q4K_DP4A = 18,
     AK_OP_Q6K_DP4A = 19,
     AK_OP_EMBED_Q = 20,
@@ -257,6 +259,8 @@ typedef struct ak_qwen_proj_report {
     float quant_us;       /* one activation quantize launch */
     float max_rel_err;    /* worst ||y_fast - y_old|| / ||y_old|| over projections */
     float kernel_rel_err; /* same, with the old kernel fed the dequantized int8 x: kernel error alone */
+    float lpr32_gbps;     /* K-quant rows on a whole warp, interleaved A/B with lpr16 */
+    float lpr16_gbps;     /* K-quant rows on a half warp (two rows per warp) */
 } ak_qwen_proj_report;
 
 /* Qwen3 GGUF runtime (native/cuda/gguf_model.cu). Weights stay Q8_0 / Q4_K / Q6_K on the device. */
@@ -288,6 +292,25 @@ AK_API ak_status ak_gguf_destroy(ak_gguf_model* model);
 AK_API ak_status ak_gguf_generate(ak_gguf_model* model, const int32_t* prompt, int n_prompt, int32_t* out_tokens,
                                   int n_gen, int backend, ak_gen_stats* stats);
 /* Logits after the last prompt token. logits must hold info.vocab floats. */
+typedef struct ak_spec_stats {
+    int32_t status;
+    int32_t rounds;
+    int32_t drafted;
+    int32_t accepted;
+    int32_t generated;
+    float prompt_ms;
+    float decode_ms;
+    float decode_tps;       /* generated tokens after the first, per second */
+    float acceptance;       /* accepted / drafted */
+    float tokens_per_round; /* tokens emitted per target verify pass */
+} ak_spec_stats;
+
+/* Greedy-verify n_tokens (1..9) at positions pos..pos+n-1 in one pass; out[c] = argmax after token c. */
+AK_API ak_status ak_gguf_verify(ak_gguf_model* model, int pos, const int32_t* tokens, int n_tokens, int32_t* out);
+/* Greedy speculative decoding: draft proposes n_draft (1..8) tokens per round, target verifies them in one pass.
+   Output is identical to greedy decoding of the target alone. Both models need the same vocabulary. */
+AK_API ak_status ak_gguf_speculate(ak_gguf_model* target, ak_gguf_model* draft, const int32_t* prompt, int n_prompt,
+                                   int32_t* out_tokens, int n_gen, int n_draft, ak_spec_stats* stats);
 AK_API ak_status ak_gguf_profile(ak_gguf_model* model, float* ms_by_op, int32_t* count_by_op);
 AK_API ak_status ak_gguf_logits(ak_gguf_model* model, const int32_t* prompt, int n_prompt, int backend, float* logits);
 

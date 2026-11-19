@@ -260,6 +260,8 @@ class Native:
                 ("quant_us", ctypes.c_float),
                 ("max_rel_err", ctypes.c_float),
                 ("kernel_rel_err", ctypes.c_float),
+                ("lpr32_gbps", ctypes.c_float),
+                ("lpr16_gbps", ctypes.c_float),
             ]
 
         self.QwenProjReport = QwenProjReport
