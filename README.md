@@ -2,7 +2,7 @@
 
 AdaKernel is a local inference experiment for a single consumer GPU. It compares eager CUDA launches, CUDA Graphs, fused elementwise kernels, and a persistent device-side task scheduler on the same FP32 decoder. The machine used for the measurements in `docs/RESULTS.md` is an NVIDIA GeForce RTX 4060 8 GB (Ada, sm_89), Ryzen 5 7600X, 32 GB RAM, Windows 11.
 
-The custom runtime generates tokens for a synthetic Qwen-style decoder (RMSNorm, QK-norm, NeoX RoPE, grouped-query attention, SwiGLU). It is not a loader for Qwen GGUF files. llama.cpp is the production baseline and is built separately.
+The custom runtime generates tokens for a synthetic Qwen-style decoder (RMSNorm, QK-norm, NeoX RoPE, grouped-query attention, SwiGLU). A second runtime, `native/cuda/gguf_model.cu`, loads Qwen3 GGUF files (Q8_0, Q4_K, Q6_K) directly and decodes with int8-activation dp4a GEMVs; `python -m benchmarks.gguf_bench` compares it with llama.cpp. `GgufModel.speculate(draft, ...)` runs greedy speculative decoding with a smaller Qwen3 as the draft (`python -m benchmarks.spec_bench`). llama.cpp is built separately under `third_party/`.
 
 ## Build
 

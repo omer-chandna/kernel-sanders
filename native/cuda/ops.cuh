@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "qgemv.cuh"
+
 namespace akd {
 
 static constexpr int kThreads = 256;
@@ -411,6 +413,62 @@ __device__ __forceinline__ void q4k_matvec_rows(const uint8_t* W, const float* x
     __syncthreads();
 }
 
+__device__ __forceinline__ float q6k_at(const uint8_t* blk, int i) {
+    uint16_t d_bits;
+    memcpy(&d_bits, blk + 208, sizeof(uint16_t));
+    const float d = half_to_f(d_bits);
+    const int half = i >> 7;
+    const int local = i & 127;
+    const uint8_t* ql = blk + half * 64;
+    const uint8_t* qh = blk + 128 + half * 32;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192) + half * 8;
+    int l = local;
+    int q = 0;
+    int scale_i = 0;
+    if (local < 32) {
+        l = local;
+        q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        scale_i = l >> 4;
+    } else if (local < 64) {
+        l = local - 32;
+        q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        scale_i = (l >> 4) + 2;
+    } else if (local < 96) {
+        l = local - 64;
+        q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        scale_i = (l >> 4) + 4;
+    } else {
+        l = local - 96;
+        q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        scale_i = (l >> 4) + 6;
+    }
+    return d * static_cast<float>(sc[scale_i]) * static_cast<float>(q - 32);
+}
+
+__device__ __forceinline__ void q6k_matvec_rows(const uint8_t* W, const float* x, float* y, int rows, int K) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int nb = K >> 8;
+    const int row_bytes = nb * 210;
+    for (int row = warp; row < rows; row += nwarps) {
+        const uint8_t* rowp = W + static_cast<size_t>(row) * row_bytes;
+        float acc = 0.f;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = rowp + b * 210;
+            const float* xb = x + b * 256;
+            for (int i = lane; i < 256; i += 32) {
+                acc += q6k_at(blk, i) * xb[i];
+            }
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) {
+            y[row] = acc;
+        }
+    }
+    __syncthreads();
+}
+
 __device__ __forceinline__ void q8_matvec_rows(const uint8_t* W, const float* x, float* y, int rows, int K) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -446,6 +504,35 @@ __device__ __forceinline__ void embed_row(const float* table, const int* token, 
     const float* src = table + static_cast<size_t>(t) * d;
     for (int i = threadIdx.x; i < d; i += blockDim.x) {
         x[i] = src[i];
+    }
+    __syncthreads();
+}
+
+// One row of a quantized embedding table, dequantized to float.
+__device__ __forceinline__ void embed_q_row(const uint8_t* table, int type, const int* token, float* x, int d) {
+    const int t = *token;
+    if (type == 0) {
+        const uint8_t* row = table + static_cast<size_t>(t) * (d >> 5) * 34;
+        for (int i = threadIdx.x; i < d; i += blockDim.x) {
+            const uint8_t* blk = row + (i >> 5) * 34;
+            uint16_t bits;
+            memcpy(&bits, blk, 2);
+            x[i] = half_to_f(bits) * static_cast<float>(reinterpret_cast<const int8_t*>(blk + 2)[i & 31]);
+        }
+    } else if (type == 1) {
+        const uint8_t* row = table + static_cast<size_t>(t) * (d >> 8) * 144;
+        for (int i = threadIdx.x; i < d; i += blockDim.x) {
+            const uint8_t* blk = row + (i >> 8) * 144;
+            uint16_t db, mb;
+            memcpy(&db, blk, 2);
+            memcpy(&mb, blk + 2, 2);
+            x[i] = q4k_at(blk + 4, blk + 16, half_to_f(db), half_to_f(mb), i & 255);
+        }
+    } else {
+        const uint8_t* row = table + static_cast<size_t>(t) * (d >> 8) * 210;
+        for (int i = threadIdx.x; i < d; i += blockDim.x) {
+            x[i] = q6k_at(row + (i >> 8) * 210, i & 255);
+        }
     }
     __syncthreads();
 }
@@ -501,6 +588,33 @@ __device__ __forceinline__ int argmax_block(const float* v, int n) {
     return out;
 }
 
+}  // namespace akd
+
+#include "decode_ops.cuh"
+
+namespace akd {
+
+__device__ __forceinline__ int attn_seq(const ak_task& t) {
+    int seq = t.p4 ? (*reinterpret_cast<const int*>(t.p4) + 1) : 1;
+    if (seq < 1) seq = 1;
+    if (t.n2 > 0 && seq > t.n2) seq = t.n2;
+    return seq;
+}
+
+template <int T>
+__device__ __forceinline__ void qgemv_dp4a_task(const ak_task& t) {
+    const uint8_t* W = reinterpret_cast<const uint8_t*>(t.p0);
+    const int8_t* xq = reinterpret_cast<const int8_t*>(t.p1);
+    const float* xd = reinterpret_cast<const float*>(t.p3);
+    float* y = reinterpret_cast<float*>(t.p2);
+    if (t.p4) {
+        qgemv_dp4a_rows<T>(W, xq, xd, y, t.n2, t.n1);
+        qgemv_dp4a_rows<T>(reinterpret_cast<const uint8_t*>(t.p4), xq, xd, y + t.n2, t.n0 - t.n2, t.n1);
+    } else {
+        qgemv_dp4a_rows<T>(W, xq, xd, y, t.n0, t.n1);
+    }
+}
+
 __device__ __forceinline__ void dispatch_task(const ak_task& t) {
     switch (t.op) {
         case AK_OP_RMSNORM:
@@ -535,6 +649,23 @@ __device__ __forceinline__ void dispatch_task(const ak_task& t) {
         case AK_OP_Q4K_MATVEC:
             q4k_matvec_rows(reinterpret_cast<const uint8_t*>(t.p0), reinterpret_cast<const float*>(t.p1),
                             reinterpret_cast<float*>(t.p2), t.n0, t.n1);
+            break;
+        case AK_OP_Q6K_MATVEC:
+            q6k_matvec_rows(reinterpret_cast<const uint8_t*>(t.p0), reinterpret_cast<const float*>(t.p1),
+                            reinterpret_cast<float*>(t.p2), t.n0, t.n1);
+            break;
+        case AK_OP_QUANT_Q8_1:
+            quantize_q8_1_n(reinterpret_cast<const float*>(t.p0), reinterpret_cast<int8_t*>(t.p1),
+                            reinterpret_cast<float*>(t.p3), t.n0);
+            break;
+        case AK_OP_Q8_DP4A:
+            qgemv_dp4a_task<0>(t);
+            break;
+        case AK_OP_Q4K_DP4A:
+            qgemv_dp4a_task<1>(t);
+            break;
+        case AK_OP_Q6K_DP4A:
+            qgemv_dp4a_task<2>(t);
             break;
         case AK_OP_SILU_MUL:
             silu_mul_n(reinterpret_cast<const float*>(t.p0), reinterpret_cast<const float*>(t.p1),
@@ -572,9 +703,49 @@ __device__ __forceinline__ void dispatch_task(const ak_task& t) {
             embed_row(reinterpret_cast<const float*>(t.p0), reinterpret_cast<const int*>(t.p1),
                       reinterpret_cast<float*>(t.p2), t.n0);
             break;
+        case AK_OP_EMBED_Q:
+            embed_q_row(reinterpret_cast<const uint8_t*>(t.p0), t.i0, reinterpret_cast<const int*>(t.p1),
+                        reinterpret_cast<float*>(t.p2), t.n0);
+            break;
+        case AK_OP_ADD_NORM_QUANT:
+            add_rmsnorm_quant(reinterpret_cast<float*>(t.p0), reinterpret_cast<const float*>(t.p1),
+                              reinterpret_cast<const float*>(t.p2), reinterpret_cast<int8_t*>(t.p4),
+                              reinterpret_cast<float*>(t.p3), t.n0, t.f0);
+            break;
+        case AK_OP_SILU_QUANT:
+            silu_quant(reinterpret_cast<const float*>(t.p0), reinterpret_cast<const float*>(t.p1),
+                       reinterpret_cast<int8_t*>(t.p2), reinterpret_cast<float*>(t.p3), t.n0);
+            break;
+        case AK_OP_QK_NORM_ROPE:
+            qk_norm_rope(reinterpret_cast<float*>(t.p0), reinterpret_cast<const float*>(t.p1), t.n0, t.n1, t.f0,
+                         reinterpret_cast<const int*>(t.p3), __int_as_float(t.i0), reinterpret_cast<float*>(t.p2),
+                         reinterpret_cast<const float*>(t.p4), reinterpret_cast<float*>(t.p5), t.n2);
+            break;
+        case AK_OP_ATTN_DECODE:
+            attn_decode_head(reinterpret_cast<const float*>(t.p0), reinterpret_cast<const float*>(t.p1),
+                             reinterpret_cast<const float*>(t.p2), reinterpret_cast<int8_t*>(t.p3),
+                             reinterpret_cast<float*>(t.p6), reinterpret_cast<float*>(t.p5), t.n0, t.n1, attn_seq(t),
+                             t.n3);
+            break;
+        case AK_OP_ARGMAX_PART:
+            argmax_part(reinterpret_cast<const float*>(t.p0), t.n0, t.i0, reinterpret_cast<unsigned long long*>(t.p1));
+            break;
         case AK_OP_FINALIZE: {
             const int sample = t.p4 ? *reinterpret_cast<const int*>(t.p4) : 1;
-            const int id = argmax_block(reinterpret_cast<const float*>(t.p0), t.n0);
+            int id = 0;
+            if (t.p6) {
+                // Packed result from AK_OP_ARGMAX_PART tasks; clear it for the next step.
+                __shared__ int packed_id;
+                if (threadIdx.x == 0) {
+                    unsigned long long* best = reinterpret_cast<unsigned long long*>(t.p6);
+                    packed_id = argmax_key_index(*reinterpret_cast<volatile unsigned long long*>(best));
+                    *best = 0ull;
+                }
+                __syncthreads();
+                id = packed_id;
+            } else {
+                id = argmax_block(reinterpret_cast<const float*>(t.p0), t.n0);
+            }
             if (threadIdx.x == 0) {
                 int* pos = reinterpret_cast<int*>(t.p1);
                 int* token = reinterpret_cast<int*>(t.p2);

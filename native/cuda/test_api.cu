@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -301,6 +302,64 @@ extern "C" ak_status ak_test_q8_matvec(const void* Wq, const float* x, float* y,
     st = run(task);
     if (st != AK_OK) return st;
     return ck(cudaMemcpy(y, dy.p, sizeof(float) * rows, cudaMemcpyDeviceToHost));
+}
+
+// type: 0 = Q8_0, 1 = Q4_K, 2 = Q6_K. Runs the quantize task and the dp4a GEMV task through ak_launch_task.
+// xq_out / xd_out receive the device-quantized activation so the caller can rebuild the exact reference.
+extern "C" ak_status ak_test_qgemv_dp4a(int type, const void* Wq, const float* x, float* y, int8_t* xq_out, float* xd_out,
+                                        int rows, int K) {
+    const int be = type == 0 ? 32 : 256;
+    const int bb = type == 0 ? 34 : (type == 1 ? 144 : 210);
+    if (type < 0 || type > 2 || rows < 1 || K < be || (K % be) != 0) {
+        ak_set_error("qgemv dp4a: bad type or K");
+        return AK_ERR_INVALID;
+    }
+    const size_t bytes = static_cast<size_t>(rows) * (K / be) * bb;
+    Dev dW(bytes), dx(sizeof(float) * K), dxq(K), dxd(sizeof(float) * (K / 32)), dy(sizeof(float) * rows);
+    if (!dW.p || !dx.p || !dxq.p || !dxd.p || !dy.p) return AK_ERR_OOM;
+    ak_status st = ck(cudaMemcpy(dW.p, Wq, bytes, cudaMemcpyHostToDevice));
+    if (st != AK_OK) return st;
+    st = ck(cudaMemcpy(dx.p, x, sizeof(float) * K, cudaMemcpyHostToDevice));
+    if (st != AK_OK) return st;
+    ak_task q{};
+    q.op = AK_OP_QUANT_Q8_1;
+    q.p0 = reinterpret_cast<uint64_t>(dx.p);
+    q.p1 = reinterpret_cast<uint64_t>(dxq.p);
+    q.p3 = reinterpret_cast<uint64_t>(dxd.p);
+    q.n0 = K;
+    st = ak_launch_task(&q, nullptr);
+    if (st != AK_OK) return st;
+    ak_task g{};
+    g.op = type == 0 ? AK_OP_Q8_DP4A : (type == 1 ? AK_OP_Q4K_DP4A : AK_OP_Q6K_DP4A);
+    g.p0 = reinterpret_cast<uint64_t>(dW.p);
+    g.p1 = reinterpret_cast<uint64_t>(dxq.p);
+    g.p2 = reinterpret_cast<uint64_t>(dy.p);
+    g.p3 = reinterpret_cast<uint64_t>(dxd.p);
+    g.n0 = rows;
+    g.n1 = K;
+    st = ak_launch_task(&g, nullptr);
+    if (st != AK_OK) return st;
+    // Same task through the block-wide dispatch used by the persistent scheduler; results must agree.
+    Dev dy2(sizeof(float) * rows);
+    if (!dy2.p) return AK_ERR_OOM;
+    g.p2 = reinterpret_cast<uint64_t>(dy2.p);
+    st = run(g);
+    if (st != AK_OK) return st;
+    std::vector<float> a(rows), b(rows);
+    st = ck(cudaMemcpy(a.data(), dy.p, sizeof(float) * rows, cudaMemcpyDeviceToHost));
+    if (st != AK_OK) return st;
+    st = ck(cudaMemcpy(b.data(), dy2.p, sizeof(float) * rows, cudaMemcpyDeviceToHost));
+    if (st != AK_OK) return st;
+    for (int r = 0; r < rows; ++r) {
+        if (a[r] != b[r]) {
+            ak_set_error("qgemv dp4a: grid and single-block dispatch disagree");
+            return AK_ERR_INVALID;
+        }
+    }
+    std::memcpy(y, a.data(), sizeof(float) * rows);
+    st = ck(cudaMemcpy(xq_out, dxq.p, K, cudaMemcpyDeviceToHost));
+    if (st != AK_OK) return st;
+    return ck(cudaMemcpy(xd_out, dxd.p, sizeof(float) * (K / 32), cudaMemcpyDeviceToHost));
 }
 
 extern "C" ak_status ak_test_q4k_matvec(const void* Wq, const float* x, float* y, int rows, int K) {

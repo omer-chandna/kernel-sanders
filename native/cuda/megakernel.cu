@@ -23,6 +23,82 @@ __global__ void q8_grid_kernel(const uint8_t* W, const float* x, float* y, int r
     akd::q8_matvec_rows(W + static_cast<size_t>(row0) * ((K >> 5) * 34), x, y + row0, nrows, K);
 }
 
+__global__ void q6k_grid_kernel(const uint8_t* W, const float* x, float* y, int rows, int K) {
+    const int nwarps = blockDim.x >> 5;
+    const int row0 = blockIdx.x * nwarps;
+    if (row0 >= rows) {
+        return;
+    }
+    int nrows = rows - row0;
+    if (nrows > nwarps) {
+        nrows = nwarps;
+    }
+    akd::q6k_matvec_rows(W + static_cast<size_t>(row0) * ((K >> 8) * 210), x, y + row0, nrows, K);
+}
+
+// rows1 > 0: rows [rows1, rows) come from W2 (same type and K). The caller keeps rows1 a multiple of the
+// per-block row count, so no block straddles the two matrices.
+template <int T>
+__global__ void dp4a_grid_kernel(const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq, const float* xd,
+                                 float* y, int rows, int K) {
+    constexpr int bb = T == 0 ? 34 : (T == 1 ? 144 : 210);
+    const int nb = T == 0 ? (K >> 5) : (K >> 8);
+    const int per_block = (blockDim.x >> 5) * akd::qgemv_rows_per_warp(T);
+    const int row0 = blockIdx.x * per_block;
+    if (row0 >= rows) {
+        return;
+    }
+    int nrows = rows - row0;
+    if (nrows > per_block) {
+        nrows = per_block;
+    }
+    const uint8_t* base = W;
+    int wrow = row0;
+    if (W2 && row0 >= rows1) {
+        base = W2;
+        wrow = row0 - rows1;
+    }
+    akd::qgemv_dp4a_rows<T>(base + static_cast<size_t>(wrow) * nb * bb, xq, xd, y + row0, nrows, K);
+}
+
+__global__ void qk_norm_rope_grid(ak_task t) {
+    // 8 heads (one per warp) per block.
+    const int h0 = blockIdx.x * (blockDim.x >> 5);
+    if (h0 >= t.n0) return;
+    const int nh = min(t.n0 - h0, static_cast<int>(blockDim.x >> 5));
+    const int hd = t.n1;
+    const int* pos = reinterpret_cast<const int*>(t.p3);
+    float* kc = reinterpret_cast<float*>(t.p2);
+    float* vc = reinterpret_cast<float*>(t.p5);
+    // Heads are absolute indices, so the KV cache stays indexed [pos][n_heads][hd] with the full head count.
+    akd::qk_norm_rope_range(reinterpret_cast<float*>(t.p0), reinterpret_cast<const float*>(t.p1), h0, nh, t.n0, hd,
+                            t.f0, pos, __int_as_float(t.i0), kc, reinterpret_cast<const float*>(t.p4), vc, t.n2);
+}
+
+__global__ void attn_decode_grid(ak_task t) {
+    // block = query head; i1 = n_rep
+    const int head = blockIdx.x;
+    const int hd = t.n1;
+    akd::attn_decode_head(reinterpret_cast<const float*>(t.p0) + head * hd, reinterpret_cast<const float*>(t.p1),
+                          reinterpret_cast<const float*>(t.p2), reinterpret_cast<int8_t*>(t.p3) + head * hd,
+                          reinterpret_cast<float*>(t.p6) + head * (hd >> 5),
+                          reinterpret_cast<float*>(t.p5) + static_cast<size_t>(head) * t.n2, head / t.i1, hd,
+                          akd::attn_seq(t), t.n3);
+}
+
+__global__ void argmax_grid(const float* v, int n, int base, unsigned long long* best) {
+    const int span = 4096;
+    const int lo = blockIdx.x * span;
+    if (lo >= n) return;
+    akd::argmax_part(v + lo, min(span, n - lo), base + lo, best);
+}
+
+__global__ void silu_quant_grid(const float* gate, const float* up, int8_t* xq, float* xd, int n) {
+    const int lo = blockIdx.x * 256;
+    if (lo >= n) return;
+    akd::silu_quant(gate + lo, up + lo, xq + lo, xd + lo / 32, min(256, n - lo));
+}
+
 __global__ void q4k_grid_kernel(const uint8_t* W, const float* x, float* y, int rows, int K) {
     const int nwarps = blockDim.x >> 5;
     const int row0 = blockIdx.x * nwarps;
@@ -162,7 +238,7 @@ __global__ void reset_kernel(ak_task* tasks, int n_tasks, const int* ready_init,
     }
 }
 
-__global__ void persist_kernel(ak_task* tasks, const int* succ, int n_tasks, int* ready, int* flags, int* cursor,
+__global__ void __launch_bounds__(akd::kThreads, 3) persist_kernel(ak_task* tasks, const int* succ, int n_tasks, int* ready, int* flags, int* cursor,
                                int* reserved, int* completed, int* error, FatGemv* fat, int max_cycles) {
     __shared__ int sid;
     __shared__ int status;
@@ -316,7 +392,58 @@ ak_status ak_launch_task(const ak_task* task, cudaStream_t stream) {
                             reinterpret_cast<float*>(task->p2), task->n0, task->n1, blocks, stream);
         return check_launch(cudaGetLastError());
     }
-    if (task->op == AK_OP_Q8_MATVEC || task->op == AK_OP_Q4K_MATVEC) {
+    if (task->op == AK_OP_QK_NORM_ROPE) {
+        qk_norm_rope_grid<<<(task->n0 + 7) / 8, akd::kThreads, 0, stream>>>(*task);
+        return check_launch(cudaGetLastError());
+    }
+    if (task->op == AK_OP_ATTN_DECODE && task->i0 > 0) {
+        attn_decode_grid<<<task->i0, akd::kThreads, 0, stream>>>(*task);
+        return check_launch(cudaGetLastError());
+    }
+    if (task->op == AK_OP_ARGMAX_PART) {
+        argmax_grid<<<(task->n0 + 4095) / 4096, akd::kThreads, 0, stream>>>(
+            reinterpret_cast<const float*>(task->p0), task->n0, task->i0,
+            reinterpret_cast<unsigned long long*>(task->p1));
+        return check_launch(cudaGetLastError());
+    }
+    if (task->op == AK_OP_SILU_QUANT) {
+        silu_quant_grid<<<(task->n0 + 255) / 256, akd::kThreads, 0, stream>>>(
+            reinterpret_cast<const float*>(task->p0), reinterpret_cast<const float*>(task->p1),
+            reinterpret_cast<int8_t*>(task->p2), reinterpret_cast<float*>(task->p3), task->n0);
+        return check_launch(cudaGetLastError());
+    }
+    if (task->op == AK_OP_QUANT_Q8_1) {
+        akd::quantize_q8_1_grid<<<(task->n0 / 32 + 7) / 8, 256, 0, stream>>>(
+            reinterpret_cast<const float*>(task->p0), reinterpret_cast<int8_t*>(task->p1),
+            reinterpret_cast<float*>(task->p3), task->n0);
+        return check_launch(cudaGetLastError());
+    }
+    if (task->op == AK_OP_Q8_DP4A || task->op == AK_OP_Q4K_DP4A || task->op == AK_OP_Q6K_DP4A) {
+        // 128-thread blocks (4 rows each) measured best on the 4060; 72 registers on the Q4_K path.
+        const int threads = 128;
+        const int type = task->op == AK_OP_Q8_DP4A ? 0 : (task->op == AK_OP_Q4K_DP4A ? 1 : 2);
+        const int per_block = (threads >> 5) * akd::qgemv_rows_per_warp(type);
+        const int blocks = (task->n0 + per_block - 1) / per_block;
+        const uint8_t* W = reinterpret_cast<const uint8_t*>(task->p0);
+        const int8_t* xq = reinterpret_cast<const int8_t*>(task->p1);
+        const float* xd = reinterpret_cast<const float*>(task->p3);
+        float* y = reinterpret_cast<float*>(task->p2);
+        const uint8_t* W2 = reinterpret_cast<const uint8_t*>(task->p4);
+        const int rows1 = W2 ? task->n2 : 0;
+        if (W2 && (rows1 % per_block) != 0) {
+            ak_set_error("dp4a pair: first matrix rows must be a multiple of the rows per block");
+            return AK_ERR_INVALID;
+        }
+        if (task->op == AK_OP_Q8_DP4A) {
+            dp4a_grid_kernel<0><<<blocks, threads, 0, stream>>>(W, W2, rows1, xq, xd, y, task->n0, task->n1);
+        } else if (task->op == AK_OP_Q4K_DP4A) {
+            dp4a_grid_kernel<1><<<blocks, threads, 0, stream>>>(W, W2, rows1, xq, xd, y, task->n0, task->n1);
+        } else {
+            dp4a_grid_kernel<2><<<blocks, threads, 0, stream>>>(W, W2, rows1, xq, xd, y, task->n0, task->n1);
+        }
+        return check_launch(cudaGetLastError());
+    }
+    if (task->op == AK_OP_Q8_MATVEC || task->op == AK_OP_Q4K_MATVEC || task->op == AK_OP_Q6K_MATVEC) {
         const int nwarps = akd::kThreads >> 5;
         int blocks = (task->n0 + nwarps - 1) / nwarps;
         if (blocks < 1) {
@@ -326,6 +453,10 @@ ak_status ak_launch_task(const ak_task* task, cudaStream_t stream) {
             q8_grid_kernel<<<blocks, akd::kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(task->p0),
                                                                 reinterpret_cast<const float*>(task->p1),
                                                                 reinterpret_cast<float*>(task->p2), task->n0, task->n1);
+        } else if (task->op == AK_OP_Q6K_MATVEC) {
+            q6k_grid_kernel<<<blocks, akd::kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(task->p0),
+                                                                 reinterpret_cast<const float*>(task->p1),
+                                                                 reinterpret_cast<float*>(task->p2), task->n0, task->n1);
         } else {
             q4k_grid_kernel<<<blocks, akd::kThreads, 0, stream>>>(reinterpret_cast<const uint8_t*>(task->p0),
                                                                  reinterpret_cast<const float*>(task->p1),

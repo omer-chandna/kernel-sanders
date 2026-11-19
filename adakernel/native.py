@@ -212,6 +212,10 @@ class Native:
         lib.ak_test_attn.argtypes = [f32, f32, f32, f32, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         lib.ak_test_q8_matvec.argtypes = [f32, f32, f32, ctypes.c_int, ctypes.c_int]
         lib.ak_test_q4k_matvec.argtypes = [f32, f32, f32, ctypes.c_int, ctypes.c_int]
+        lib.ak_test_qgemv_dp4a.argtypes = [
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+        ]
         lib.ak_model_create.argtypes = [ctypes.POINTER(ModelConfig), ctypes.POINTER(Fp32Weights), ctypes.POINTER(ctypes.c_void_p)]
         lib.ak_model_destroy.argtypes = [ctypes.c_void_p]
         lib.ak_model_logits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, f32]
@@ -239,6 +243,30 @@ class Native:
             ctypes.c_int,
             ctypes.POINTER(GenStats),
         ]
+        class QwenProjReport(ctypes.Structure):
+            _fields_ = [
+                ("n_proj", ctypes.c_int32),
+                ("n_q4", ctypes.c_int32),
+                ("n_q6", ctypes.c_int32),
+                ("n_q8", ctypes.c_int32),
+                ("weight_gb", ctypes.c_float),
+                ("old_ms", ctypes.c_float),
+                ("fast_ms", ctypes.c_float),
+                ("old_gbps", ctypes.c_float),
+                ("fast_gbps", ctypes.c_float),
+                ("q4_gbps", ctypes.c_float),
+                ("q6_gbps", ctypes.c_float),
+                ("q8_gbps", ctypes.c_float),
+                ("quant_us", ctypes.c_float),
+                ("max_rel_err", ctypes.c_float),
+                ("kernel_rel_err", ctypes.c_float),
+                ("lpr32_gbps", ctypes.c_float),
+                ("lpr16_gbps", ctypes.c_float),
+            ]
+
+        self.QwenProjReport = QwenProjReport
+        lib.ak_bench_qwen35_projections.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(QwenProjReport)]
+        lib.ak_bench_qwen35_projections.restype = ctypes.c_int
         lib.ak_microbench.argtypes = [
             ctypes.c_int,
             ctypes.c_int,
@@ -399,6 +427,21 @@ class Native:
         self.check(self.lib.ak_test_q8_matvec(self._ptr(raw), self._ptr(x), self._ptr(y), rows, k))
         return y
 
+    def qgemv_dp4a(self, qtype: str, packed: np.ndarray, vector: np.ndarray, rows: int, k: int):
+        """int8-activation dp4a GEMV. Returns (y, xq, xd): the output and the device-quantized activation."""
+        code = {"q8_0": 0, "q4_k": 1, "q6_k": 2}[qtype]
+        raw = np.ascontiguousarray(packed, dtype=np.uint8)
+        x = np.ascontiguousarray(vector, dtype=np.float32).reshape(-1)
+        y = np.empty(rows, dtype=np.float32)
+        xq = np.empty(k, dtype=np.int8)
+        xd = np.empty(k // 32, dtype=np.float32)
+        self.check(
+            self.lib.ak_test_qgemv_dp4a(
+                code, self._ptr(raw), self._ptr(x), self._ptr(y), self._ptr(xq), self._ptr(xd), rows, k
+            )
+        )
+        return y, xq, xd
+
     def q4k_matvec(self, packed: np.ndarray, vector: np.ndarray, rows: int, k: int) -> np.ndarray:
         raw = np.ascontiguousarray(packed, dtype=np.uint8)
         x = np.ascontiguousarray(vector, dtype=np.float32).reshape(-1)
@@ -436,6 +479,11 @@ class Native:
             "launch_persistent_us": report.launch_persistent_us,
             "coop_supported": report.coop_supported,
         }
+
+    def qwen35_projections(self, path: str, iters: int = 3) -> dict:
+        report = self.QwenProjReport()
+        self.check(self.lib.ak_bench_qwen35_projections(path.encode("utf-8"), int(iters), ctypes.byref(report)))
+        return {name: getattr(report, name) for name, _ in report._fields_}
 
 
 class Model:
