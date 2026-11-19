@@ -601,6 +601,20 @@ __device__ __forceinline__ int attn_seq(const ak_task& t) {
     return seq;
 }
 
+template <int T>
+__device__ __forceinline__ void qgemv_dp4a_task(const ak_task& t) {
+    const uint8_t* W = reinterpret_cast<const uint8_t*>(t.p0);
+    const int8_t* xq = reinterpret_cast<const int8_t*>(t.p1);
+    const float* xd = reinterpret_cast<const float*>(t.p3);
+    float* y = reinterpret_cast<float*>(t.p2);
+    if (t.p4) {
+        qgemv_dp4a_rows<T>(W, xq, xd, y, t.n2, t.n1);
+        qgemv_dp4a_rows<T>(reinterpret_cast<const uint8_t*>(t.p4), xq, xd, y + t.n2, t.n0 - t.n2, t.n1);
+    } else {
+        qgemv_dp4a_rows<T>(W, xq, xd, y, t.n0, t.n1);
+    }
+}
+
 __device__ __forceinline__ void dispatch_task(const ak_task& t) {
     switch (t.op) {
         case AK_OP_RMSNORM:
@@ -645,16 +659,13 @@ __device__ __forceinline__ void dispatch_task(const ak_task& t) {
                             reinterpret_cast<float*>(t.p3), t.n0);
             break;
         case AK_OP_Q8_DP4A:
-            qgemv_dp4a_rows<0>(reinterpret_cast<const uint8_t*>(t.p0), reinterpret_cast<const int8_t*>(t.p1),
-                               reinterpret_cast<const float*>(t.p3), reinterpret_cast<float*>(t.p2), t.n0, t.n1);
+            qgemv_dp4a_task<0>(t);
             break;
         case AK_OP_Q4K_DP4A:
-            qgemv_dp4a_rows<1>(reinterpret_cast<const uint8_t*>(t.p0), reinterpret_cast<const int8_t*>(t.p1),
-                               reinterpret_cast<const float*>(t.p3), reinterpret_cast<float*>(t.p2), t.n0, t.n1);
+            qgemv_dp4a_task<1>(t);
             break;
         case AK_OP_Q6K_DP4A:
-            qgemv_dp4a_rows<2>(reinterpret_cast<const uint8_t*>(t.p0), reinterpret_cast<const int8_t*>(t.p1),
-                               reinterpret_cast<const float*>(t.p3), reinterpret_cast<float*>(t.p2), t.n0, t.n1);
+            qgemv_dp4a_task<2>(t);
             break;
         case AK_OP_SILU_MUL:
             silu_mul_n(reinterpret_cast<const float*>(t.p0), reinterpret_cast<const float*>(t.p1),
