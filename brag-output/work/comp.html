@@ -1,0 +1,146 @@
+<!doctype html><meta charset="utf-8">
+<style>
+@font-face{font-family:S;font-weight:700;src:url(assets/dv700.woff2) format('woff2')}
+@font-face{font-family:M;font-weight:400;src:url(assets/dvmono400.woff2) format('woff2')}
+*{box-sizing:border-box;margin:0}
+html,body{width:1920px;height:1080px;overflow:hidden;background:#0b0f14}
+#stage{position:relative;width:1920px;height:1080px;overflow:hidden;background:#0b0f14;font-family:S,sans-serif;font-weight:700;color:#e6edf3}
+.glow{position:absolute;border-radius:50%;filter:blur(130px)}
+.abs{position:absolute;opacity:0;will-change:transform,opacity;white-space:nowrap}
+.m{font-family:M,monospace;font-weight:400}
+.lime{color:#a3e635}.amber{color:#f5a524}.mu{color:#8b98a9}.red{color:#f87171}
+.chip{position:absolute;width:170px;height:100px;border-radius:16px;display:flex;align-items:center;justify-content:center;font:400 38px M,monospace;opacity:0}
+.draft{border:3px solid #f5a524;background:rgba(245,165,36,.12);color:#f5a524}
+.slot{border:3px solid #2b3544;background:#121821;color:#e6edf3}
+.bar{position:absolute;border-radius:8px;transform-origin:0 50%}
+.lab{position:absolute;white-space:nowrap}
+</style>
+<div id="stage">
+ <div class="glow" id="g1" style="width:760px;height:760px;left:-240px;bottom:-300px;background:#a3e635;opacity:.10"></div>
+ <div class="glow" id="g2" style="width:700px;height:700px;right:-240px;top:-280px;background:#f5a524;opacity:.10"></div>
+
+ <!-- S1 -->
+ <div class="abs m amber" id="k0" style="left:124px;top:150px;font-size:52px;letter-spacing:2px">up to</div>
+ <div class="abs lime" id="k1" style="left:104px;top:210px;font-size:300px;letter-spacing:-14px">+44%</div>
+ <div class="abs" id="k2" style="left:120px;top:575px;font-size:72px;letter-spacing:-3px">faster speculative decoding</div>
+ <div class="abs mu" id="k3" style="left:120px;top:665px;font-size:60px;letter-spacing:-2px">with a draft model, on one 8 GB card.</div>
+
+ <!-- S2 -->
+ <div class="abs m lime" id="e2" style="left:120px;top:96px;font-size:28px;letter-spacing:3px">ADAKERNEL · SPECULATIVE DECODING</div>
+ <div class="abs" id="t2" style="left:120px;top:150px;font-size:84px;letter-spacing:-4px">Read the weights fewer times.</div>
+ <div class="abs m mu" id="s2sub" style="left:124px;top:262px;font-size:30px">Qwen3-8B Q4_K_M reads 4.67 GB of weights for every token.</div>
+ <div class="abs m amber" id="dl" style="left:120px;top:372px;font-size:30px">draft<br><span class="mu" style="font-size:24px">Qwen3-0.6B</span></div>
+ <div class="abs m lime" id="tl" style="left:120px;top:572px;font-size:30px">target<br><span class="mu" style="font-size:24px">Qwen3-8B · one pass</span></div>
+ <div id="chips"></div>
+ <div class="abs" id="sweep" style="left:520px;top:530px;width:170px;height:120px;border-radius:18px;background:linear-gradient(90deg,rgba(163,230,53,0),rgba(163,230,53,.35),rgba(163,230,53,0))"></div>
+ <div class="abs" id="cA" style="left:120px;top:760px;font-size:54px;letter-spacing:-2px">The draft proposes 3 tokens.</div>
+ <div class="abs" id="cB" style="left:120px;top:836px;font-size:54px;letter-spacing:-2px">The target checks all 4 in one pass.</div>
+ <div class="abs lime" id="cC" style="left:120px;top:912px;font-size:54px;letter-spacing:-2px">Keeps the match, plus one.</div>
+
+ <!-- S3 -->
+ <div class="abs" id="t3" style="left:120px;top:70px;font-size:96px;letter-spacing:-5px">Level with llama.cpp.</div>
+ <div class="abs m mu" id="s3" style="left:124px;top:196px;font-size:30px">plain greedy decode, tok/s</div>
+ <div class="abs m" id="lg" style="right:120px;top:100px;font-size:28px"><span class="amber">■ llama.cpp</span>&nbsp;&nbsp;&nbsp;<span class="lime">■ AdaKernel</span></div>
+ <div id="rows3"></div>
+ <div class="abs m lime" id="p3" style="left:120px;top:972px;font-size:42px">Never more than 3% behind.</div>
+
+ <!-- S4 -->
+ <div class="abs" id="t4" style="left:120px;top:46px;font-size:68px;letter-spacing:-3px">Speculative decoding, k=3</div>
+ <div class="abs m mu" id="s4" style="left:124px;top:132px;font-size:26px">AdaKernel vs llama-speculative · same target · same 0.6B draft · tok/s</div>
+ <div class="abs m" id="lg4" style="right:120px;top:70px;font-size:26px"><span class="amber">■ llama-speculative</span>&nbsp;&nbsp;&nbsp;<span class="lime">■ AdaKernel</span></div>
+ <div id="rows4"></div>
+ <div class="abs lime" id="big" style="left:1500px;top:400px;font-size:104px;letter-spacing:-5px">+18%</div>
+ <div class="abs" id="big2" style="left:1506px;top:530px;font-size:68px;letter-spacing:-4px">to +44%</div>
+ <div class="abs m mu" id="big3" style="left:1510px;top:650px;font-size:24px;line-height:1.5">over llama-speculative<br>8 target/prompt pairs</div>
+
+ <!-- S5 -->
+ <div class="abs" id="w1" style="left:0;right:0;text-align:center;top:300px;font-size:210px;letter-spacing:-11px">kernel-sanders</div>
+ <div class="abs m lime" id="w2" style="left:0;right:0;text-align:center;top:560px;font-size:52px;letter-spacing:4px">ADAKERNEL</div>
+ <div class="abs m mu" id="w3" style="left:0;right:0;text-align:center;top:660px;font-size:32px">A hand-written CUDA runtime for Qwen3 GGUF on one 8 GB RTX 4060.</div>
+ <div class="abs m mu" id="w4" style="left:0;right:0;text-align:center;top:716px;font-size:32px">Every number measured on that one card.</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const clamp=(x,a=0,b=1)=>Math.min(b,Math.max(a,x));
+const prog=(t,a,b)=>clamp((t-a)/(b-a));
+const eo=x=>1-Math.pow(1-x,3), eio=x=>x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+let T=0;
+function show(el,a,b,o={}){
+  const inD=o.inD||.5,outD=o.outD||.3,dy=o.dy==null?26:o.dy,dx=o.dx||0;
+  const pi=eo(prog(T,a,a+inD)),po=prog(T,b-outD,b);
+  el.style.opacity=pi*(1-po);
+  el.style.transform=`translate(${(1-pi)*dx}px,${(1-pi)*dy-po*8}px)`;
+}
+const mk=(cls,html,css,parent)=>{const d=document.createElement('div');d.className=cls;d.innerHTML=html;d.style.cssText=css;parent.appendChild(d);return d};
+// S2 chips and slots
+const chips=[],slots=[];
+for(let i=0;i<3;i++) chips.push(mk('chip draft','d'+(i+1),`left:${520+i*200}px;top:340px`,$('chips')));
+const lines=[];
+for(let i=0;i<4;i++) slots.push(mk('chip slot','',`left:${520+i*200}px;top:540px`,$('chips')));
+for(let i=0;i<3;i++){const l=mk('abs','',`left:${604+i*200}px;top:442px;width:3px;height:96px;background:#2b3544;border-radius:2px`,$('chips'));lines.push(l)}
+// S3 rows
+const P=[['Qwen3-0.6B Q8_0',276.8,274.5,'0.99'],['Qwen3-4B Q4_K_M',84.4,86.3,'1.02'],['Qwen3-8B Q4_K_M',49.9,48.3,'0.97']];
+const R3=[];P.forEach((p,i)=>{
+  const y=290+i*220,mx=Math.max(p[1],p[2]),s=1000/mx;
+  const r=document.createElement('div');r.className='abs';r.style.cssText='left:0;top:0;width:1920px;height:1080px';$('rows3').appendChild(r);
+  mk('lab m','<span>'+p[0]+'</span>',`left:120px;top:${y}px;font-size:34px;color:#e6edf3`,r);
+  const b1=mk('bar','',`left:120px;top:${y+54}px;height:46px;width:${p[1]*s}px;background:#f5a524`,r);
+  const b2=mk('bar','',`left:120px;top:${y+108}px;height:46px;width:${p[2]*s}px;background:#a3e635`,r);
+  const n1=mk('lab m',p[1].toFixed(1),`left:${130+p[1]*s}px;top:${y+54}px;font-size:34px;color:#f5a524;line-height:46px`,r);
+  const n2=mk('lab m',p[2].toFixed(1),`left:${130+p[2]*s}px;top:${y+108}px;font-size:34px;color:#a3e635;line-height:46px`,r);
+  const pill=mk('lab m','ratio '+p[3],`left:1620px;top:${y+80}px;font-size:34px;color:#e6edf3;border:2px solid #2b3544;border-radius:999px;padding:6px 22px`,r);
+  R3.push({r,b1,b2,n1,n2,pill,w1:p[1]*s,w2:p[2]*s});
+});
+// S4 rows
+const D=[['8B · story',77.4,65.5],['8B · explain',76.0,59.5],['8B · code',89.8,73.9],['8B · facts',100.3,80.4],['4B · story',97.5,77.1],['4B · explain',125.8,94.5],['4B · code',114.8,82.7],['4B · facts',138.8,96.5]];
+const R4=[];D.forEach((d,i)=>{
+  const y=190+i*100,sc=6.0,x0=400;
+  const r=document.createElement('div');r.className='abs';r.style.cssText='left:0;top:0;width:1920px;height:1080px';$('rows4').appendChild(r);
+  mk('lab m',d[0],`left:120px;top:${y+22}px;font-size:32px;color:#e6edf3`,r);
+  const b1=mk('bar','',`left:${x0}px;top:${y+4}px;height:34px;width:${d[2]*sc}px;background:#f5a524`,r);
+  const b2=mk('bar','',`left:${x0}px;top:${y+44}px;height:34px;width:${d[1]*sc}px;background:#a3e635`,r);
+  const n1=mk('lab m',d[2].toFixed(1),`left:${x0+10+d[2]*sc}px;top:${y+4}px;font-size:26px;color:#f5a524;line-height:34px`,r);
+  const n2=mk('lab m',d[1].toFixed(1),`left:${x0+10+d[1]*sc}px;top:${y+44}px;font-size:26px;color:#a3e635;line-height:34px`,r);
+  const g=Math.round((d[1]/d[2]-1)*100);
+  const pill=mk('lab m','+'+g+'%',`left:1350px;top:${y+24}px;font-size:32px;color:#0b0f14;background:#a3e635;border-radius:999px;padding:2px 18px;font-weight:700`,r);
+  R4.push({r,b1,b2,n1,n2,pill,w1:d[2]*sc,w2:d[1]*sc});
+});
+function seek(t){
+  T=t;
+  $('g1').style.transform=`translate(${Math.sin(t*.3)*40}px,${Math.cos(t*.25)*30}px)`;
+  $('g2').style.transform=`translate(${Math.cos(t*.2)*40}px,${Math.sin(t*.3)*30}px)`;
+  // S1 (0-2.5)
+  show($('k0'),.15,2.5,{inD:.5,dy:20}); show($('k1'),.25,2.5,{inD:.7,dy:40}); show($('k2'),.9,2.5,{inD:.55}); show($('k3'),1.4,2.5,{inD:.55});
+  // S2 (2.5-8.1)
+  show($('e2'),2.7,8.1,{inD:.4}); show($('s2sub'),3.0,8.1,{inD:.4,dy:14}); show($('t2'),2.8,8.1,{inD:.55});
+  show($('dl'),2.95,8.1,{inD:.4,dy:0}); show($('tl'),4.9,8.1,{inD:.4,dy:0});
+  [3.125,3.75,4.375].forEach((a,i)=>{const e=chips[i],pi=eo(prog(T,a,a+.35)),po=prog(T,7.8,8.1);e.style.opacity=pi*(1-po);e.style.transform=`translateY(${(1-pi)*-30}px) scale(${.9+.1*pi})`});
+  slots.forEach((e,i)=>{const a=i===0?5.0:5.0; const pi=eo(prog(T,5.0,5.35)),po=prog(T,7.8,8.1);e.style.opacity=pi*(1-po)});
+  lines.forEach(l=>{const pi=eo(prog(T,5.0,5.4)),po=prog(T,7.8,8.1);l.style.opacity=pi*(1-po)*.9;l.style.transform=`scaleY(${pi})`;l.style.transformOrigin='50% 0'});
+  const sw=$('sweep'),sp=prog(T,5.0,5.9);sw.style.opacity=(sp>0&&sp<1)?1:0;sw.style.transform=`translateX(${eio(sp)*620}px)`;
+  const st=[[5.9375,'ok','d1'],[6.25,'ok','d2'],[6.5625,'bad','d3'],[6.875,'bonus','+1']];
+  st.forEach(([a,k,txt],i)=>{const e=slots[i],p=eo(prog(T,a,a+.3));
+    if(T>=a){ if(k==='ok'||k==='bonus'){e.style.background='#a3e635';e.style.borderColor='#a3e635';e.style.color='#0b0f14'} else {e.style.background='#f87171';e.style.borderColor='#f87171';e.style.color='#0b0f14'}
+      e.textContent=k==='bad'?'✗':(k==='bonus'?'+1':'✓'); e.style.transform=`scale(${1+.08*(1-p)})`}
+    else {e.style.background='#121821';e.style.borderColor='#2b3544';e.style.color='#e6edf3';e.textContent='';e.style.transform='none'}});
+  show($('cA'),3.0,8.1,{inD:.45}); show($('cB'),5.0,8.1,{inD:.45}); show($('cC'),6.875,8.1,{inD:.45});
+  // S3 (8.4-11.875)
+  show($('t3'),8.45,11.875,{inD:.5}); show($('s3'),8.6,11.875,{inD:.4}); show($('lg'),8.6,11.875,{inD:.4});
+  [8.75,9.6875,10.625].forEach((a,i)=>{const o=R3[i],pi=eo(prog(T,a,a+.5)),po=prog(T,11.55,11.875);
+    o.r.style.opacity=(T>=a?1:0)*(1-po);
+    o.b1.style.transform=`scaleX(${pi})`;o.b2.style.transform=`scaleX(${eo(prog(T,a+.12,a+.62))})`;
+    const f=eo(prog(T,a+.4,a+.8));o.n1.style.opacity=f;o.n2.style.opacity=f;o.pill.style.opacity=f;});
+  show($('p3'),10.4,11.875,{inD:.45});
+  // S4 (11.875-19.375)
+  show($('t4'),12.0,19.375,{inD:.5,outD:.35}); show($('s4'),12.2,19.375,{inD:.4,outD:.35}); show($('lg4'),12.3,19.375,{inD:.4,outD:.35,dy:0});
+  for(let i=0;i<8;i++){const a=12.5+.625*i,o=R4[i],po=prog(T,19.05,19.375);
+    o.r.style.opacity=(T>=a?1:0)*(1-po);
+    o.b1.style.transform=`scaleX(${eo(prog(T,a,a+.45))})`;o.b2.style.transform=`scaleX(${eo(prog(T,a+.1,a+.55))})`;
+    const f=eo(prog(T,a+.35,a+.7));o.n1.style.opacity=f;o.n2.style.opacity=f;o.pill.style.opacity=f;}
+  show($('big'),17.8125,19.375,{inD:.5,outD:.35}); show($('big2'),18.0,19.375,{inD:.5,outD:.35}); show($('big3'),18.2,19.375,{inD:.5,outD:.35});
+  // S5
+  show($('w1'),19.5,23,{inD:.7,outD:.01,dy:30}); show($('w2'),20.2,23,{inD:.5,outD:.01,dy:20}); show($('w3'),20.7,23,{inD:.5,outD:.01,dy:16}); show($('w4'),21.1,23,{inD:.5,outD:.01,dy:16});
+}
+window.seek=seek;
+Promise.all([document.fonts.load('700 40px S'),document.fonts.load('400 40px M')]).then(()=>document.fonts.ready).then(()=>{seek(0);window.ready=true});
+</script>

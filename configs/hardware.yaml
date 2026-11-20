@@ -36,4 +36,4 @@ cuda_device:
   total_vram_mb: 8187.5
   free_vram_mb: 7106.0
   theoretical_bandwidth_gbps: 272.0320129394531
-dll: C:\Users\OmerC\kernel-sanders\build\adakernel.dll
+dll: build\adakernel.dll

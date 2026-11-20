@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$py = "C:\Users\OmerC\AppData\Local\Programs\Python\Python312\python.exe"
+$py = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"
 if (-not (Test-Path $py)) { $py = "py -3.12" }
 if (-not (Test-Path .venv\Scripts\python.exe)) {
     & $py -m venv .venv
