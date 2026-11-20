@@ -21,9 +21,19 @@ AdaKernel loads Qwen3 GGUF files (Q8_0, Q4_K, Q6_K) straight from disk and decod
 
 **Why it matters:** at batch 1, an 8 GB card is limited by memory bandwidth, not math. Qwen3-8B Q4_K_M reads 4.67 GB of weights for every token. The only way past that wall is to read the weights fewer times per token, and that's what the verify pass does.
 
-**Quick links:** [Features](#-features) · [Results](#-results) · [How it works](#-how-it-works) · [Quick Start](#-quick-start) · [Project Structure](#-project-structure) · [Configuration](#-configuration) · [Testing](#-testing) · [Future Extensions](#-future-extensions)
+**Quick links:** [Demo](#-demo) · [Features](#-features) · [Results](#-results) · [How it works](#-how-it-works) · [Quick Start](#-quick-start) · [Project Structure](#-project-structure) · [Configuration](#-configuration) · [Testing](#-testing) · [Future Extensions](#-future-extensions)
 
 <p align="center"><img src=".github/readme/divider.svg" alt="" width="100%"></p>
+
+## 🎬 Demo
+
+<p align="center">
+  <a href=".github/readme/brag.mp4"><img src=".github/readme/demo.gif" alt="A 22-second film of the measured results: Qwen3-8B reads 4.67 GB per token, one speculative round of three drafted tokens, parity with llama.cpp, and AdaKernel 18 to 44 percent faster than llama-speculative across eight target and prompt pairs." width="100%"></a>
+  <br>
+  <sub>▶ Click for the full 22-second video with sound. Every figure in it is from <a href="docs/RESULTS.md"><code>docs/RESULTS.md</code></a>.</sub>
+</p>
+
+<!-- For an inline player: drag .github/readme/brag.mp4 into the GitHub README editor and paste the user-attachments URL here. -->
 
 ## ✨ Features
 

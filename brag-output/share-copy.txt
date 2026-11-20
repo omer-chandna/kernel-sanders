@@ -1,0 +1,1 @@
+A hand-written CUDA runtime for Qwen3 on one 8 GB RTX 4060: level with llama.cpp on plain decode, and 18 to 44% faster than llama-speculative. Every number measured on that one card.
