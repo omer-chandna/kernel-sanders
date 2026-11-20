@@ -60,6 +60,18 @@ def _nvidia_smi() -> dict:
     return dict(zip(keys, values))
 
 
+def _repo_path(path: str | Path) -> str:
+    """Path relative to the repo root, or just the file name if it lives elsewhere.
+
+    configs/hardware.yaml is committed, so it must not record the user's home directory.
+    """
+    p = Path(path).resolve()
+    try:
+        return str(p.relative_to(ROOT))
+    except ValueError:
+        return p.name
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     info = {
         "platform": platform.platform(),
@@ -70,7 +82,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     try:
         native = Native()
         info["cuda_device"] = native.device_query()
-        info["dll"] = str(native.lib._name)
+        info["dll"] = _repo_path(native.lib._name)
     except Exception as exc:  # noqa: BLE001 - doctor reports the failure instead of crashing.
         info["cuda_device"] = {"error": str(exc)}
     out = ROOT / "experiments" / "results"
